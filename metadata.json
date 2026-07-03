@@ -1,0 +1,6 @@
+{
+  "name": "领域知识工程自动化工具",
+  "description": "基于假设-验证-推导(Hypothesis-Verification-Deduction)的敏捷领域工程工具，模拟人类专家认知的闭环知识建模。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
