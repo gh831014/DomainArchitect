@@ -11,6 +11,40 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { db } from './server/db';
 import { KB_Store, Hypothesis, Concept, Entity, AggregateRoot, BusinessScenario, BusinessProcess, CoreLogic, GeneratorConfig, LevelTwoModule, LevelThreeElement, SystemInteraction } from './src/types';
 
+// Global error handlers to prevent async rejections or exceptions from crashing the server
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception thrown:', err);
+});
+
+// Resilient Concurrency Worker Pool for processing CPU/network intensive LLM and Search requests
+async function runWithConcurrencyLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let currentIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (currentIndex < items.length) {
+      const index = currentIndex++;
+      try {
+        results[index] = await fn(items[index], index);
+      } catch (err) {
+        console.error(`Concurrency pool worker error at index ${index}:`, err);
+        throw err;
+      }
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -48,8 +82,8 @@ async function generateContentWithRetry(
   let attempt = 0;
   while (true) {
     try {
-      // Small defensive delay of 1.5 seconds between requests of any kind to avoid instant RPM limits
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Small defensive delay of 100ms between requests of any kind to avoid instant RPM limits
+      await new Promise((resolve) => setTimeout(resolve, 100));
       const res = await ai.models.generateContent(options);
       if (task && res) {
         if (!task.tokenStats) {
@@ -67,16 +101,28 @@ async function generateContentWithRetry(
     } catch (err: any) {
       attempt++;
       const errMsg = err?.message || String(err);
+      
       const isRateLimit = errMsg.includes('429') || 
                           errMsg.toLowerCase().includes('quota') || 
                           errMsg.toLowerCase().includes('exhausted') ||
                           errMsg.toLowerCase().includes('limit');
       
-      if (isRateLimit && attempt <= maxRetries) {
+      const isTransient = errMsg.includes('500') ||
+                          errMsg.includes('502') ||
+                          errMsg.includes('503') ||
+                          errMsg.includes('504') ||
+                          errMsg.toLowerCase().includes('timeout') ||
+                          errMsg.toLowerCase().includes('abort') ||
+                          errMsg.toLowerCase().includes('fetch failed') ||
+                          errMsg.toLowerCase().includes('network') ||
+                          errMsg.toLowerCase().includes('socket') ||
+                          errMsg.toLowerCase().includes('connection');
+      
+      if ((isRateLimit || isTransient) && attempt <= maxRetries) {
         // Calculate exponential backoff delay with a slight random jitter
         const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
-        const warningMsg = `⚠️ [服务器警告] 触发 Gemini API 频率/配额限制 (429/Resource Exhausted)。系统将在 ${(delay / 1000).toFixed(1)} 秒后自动重试 (第 ${attempt}/${maxRetries} 次重试)...`;
-        console.warn(warningMsg, errMsg);
+        const warningMsg = `⚠️ [服务器警告] Gemini API 触发配额限制或网络抖动 (${isRateLimit ? '429 限流' : '网络异常'})。系统将在 ${(delay / 1000).toFixed(1)} 秒后自动重试 (第 ${attempt}/${maxRetries} 次重试)... 详情: ${errMsg}`;
+        console.warn(warningMsg);
         
         if (task) {
           task.logs.push({
@@ -113,8 +159,12 @@ async function performDualEngineSearch(
       });
       db.saveTask(task);
 
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+
       const response = await fetch('https://api.tavily.com/search', {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json'
         },
@@ -123,9 +173,11 @@ async function performDualEngineSearch(
           query: query,
           search_depth: 'basic',
           include_answer: true,
-          max_results: 5
+          max_results: 20
         })
       });
+
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
         throw new Error(`Tavily HTTP 错误! 状态码: ${response.status}`);
@@ -211,10 +263,14 @@ async function generateContentWithDeepSeek(
   while (true) {
     try {
       // Anti-aggression pace limit
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 50000); // Expanded timeout to 50 seconds to accommodate heavy DDD/architecture derivation
 
       const response = await fetch('https://api.deepseek.com/chat/completions', {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`
@@ -236,7 +292,12 @@ async function generateContentWithDeepSeek(
         })
       });
 
+      clearTimeout(timeoutId);
+
       if (!response.ok) {
+        if (response.status === 401 || response.status === 402 || response.status === 403) {
+          throw new Error(`DeepSeek API Key 鉴权失败、额度不足或被拒绝 (Status ${response.status})。无须重试，直接故障转移至 Gemini。`);
+        }
         const errText = await response.text();
         throw new Error(`DeepSeek API status ${response.status}: ${errText}`);
       }
@@ -259,14 +320,11 @@ async function generateContentWithDeepSeek(
     } catch (err: any) {
       attempt++;
       const errMsg = err?.message || String(err);
-      const isRateLimit = errMsg.includes('429') || 
-                          errMsg.toLowerCase().includes('quota') || 
-                          errMsg.toLowerCase().includes('exhausted') || 
-                          errMsg.toLowerCase().includes('limit');
-
+      const isAbort = errMsg.toLowerCase().includes('abort') || errMsg.toLowerCase().includes('timeout');
+      
       if (attempt <= maxRetries) {
         const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
-        const msg = `⚠️ [DeepSeek 接口重试] 触发频率限制或网络超时 (${errMsg})。将在 ${(delay / 1000).toFixed(1)} 秒后进行第 ${attempt}/${maxRetries} 次重试...`;
+        const msg = `⚠️ [DeepSeek 接口重试] ${isAbort ? '请求遭遇超时' : '触发频率限制或网络抖动'} (${errMsg})。将在 ${(delay / 1000).toFixed(1)} 秒后进行第 ${attempt}/${maxRetries} 次重试...`;
         console.warn(msg);
         if (task) {
           task.logs.push({
@@ -375,7 +433,7 @@ app.post('/api/domains/analyze-structure', async (req, res) => {
       }
     });
 
-    const parsed = JSON.parse(gRes.text?.trim() || '{}');
+    const parsed = safeParseJSON(gRes.text || '{}', {});
     res.json(parsed);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -485,7 +543,7 @@ ${JSON.stringify(payload, null, 2)}
       }
     });
 
-    const classifications = JSON.parse(gRes.text?.trim() || '[]');
+    const classifications = safeParseJSON<any[]>(gRes.text || '[]', []);
     if (Array.isArray(classifications)) {
       kb.concepts = kb.concepts.map(c => {
         const matched = classifications.find(item => item.id === c.id);
@@ -1243,22 +1301,32 @@ ${parts.join('\n\n')}\n`;
   // ==========================================
   // PHASE 1: 行业/知识体系知识树构建 (Tasks 1.1 - 1.4)
   // ==========================================
+  kb.checkpoints = kb.checkpoints || {};
+
   try {
-    task.message = '正在启动 1.1: 行业通用常识与通识分析提取以及高阶对标验证...';
-    task.logs.push({
-      timestamp: new Date().toISOString(),
-      message: `【阶段一：构建行业领域知识树】\n【1.1 行业通识假设生成与验证】针对 [${kb.domain.name}] 开始提取基础术语、子行业划分、典型业务流程。`,
-      type: 'info',
-    });
-    db.saveTask(task);
+    if (kb.checkpoints.phase1_1) {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `⏭️ [断点续传] 检测到阶段 1.1 (行业通用常识与通识分析) 已在之前成功完成，自动快速跳过。`,
+        type: 'info'
+      });
+      db.saveTask(task);
+    } else {
+      task.message = '正在启动 1.1: 行业通用常识与通识分析提取以及高阶对标验证...';
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `【阶段一：构建行业领域知识树】\n【1.1 行业通识假设生成与验证】针对 [${kb.domain.name}] 开始提取基础术语、子行业划分、典型业务流程。`,
+        type: 'info',
+      });
+      db.saveTask(task);
 
-    // 1.1 Industry Common Knowledge
-    const existingCommonStr = kb.concepts
-      .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_general')
-      .map(c => `[${c.name}]: ${c.definition}`)
-      .join('\n');
+      // 1.1 Industry Common Knowledge
+      const existingCommonStr = kb.concepts
+        .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_general')
+        .map(c => `[${c.name}]: ${c.definition}`)
+        .join('\n');
 
-    const prompt1_1 = `## 角色
+      const prompt1_1 = `## 角色
 你是一名资深的行业分析专家，擅长提炼某个行业的共同认知。
 
 ## 任务
@@ -1296,35 +1364,32 @@ ${existingCommonStr || '暂无'}
   }
 ]`;
 
-    const res1_1 = await generateFlexibleLLM(prompt1_1, true, task, ai, model);
-    let text1_1 = stripMarkdownCodeBlock(res1_1.text || '[]');
-    const rawHypList1_1 = JSON.parse(text1_1) as any[];
+      const res1_1 = await generateFlexibleLLM(prompt1_1, true, task, ai, model);
+      const rawHypList1_1 = safeParseJSON<any[]>(res1_1.text || '[]', []);
 
-    task.logs.push({
-      timestamp: new Date().toISOString(),
-      message: `📊 共生成 ${rawHypList1_1.length} 个行业通识探针假设，正在对每一条通过搜索引擎和学术定义进行交叉论证校验...`,
-      type: 'info',
-    });
-    db.saveTask(task);
-
-    // Verify 1.1 terms/sub_industries/processes
-    for (const rawHyp of rawHypList1_1) {
-      if (!rawHyp.name) continue;
-      task.message = `[1.1] 正在验证通识假设: ${rawHyp.name}`;
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `📊 共生成 ${rawHypList1_1.length} 个行业通识探针假设，正在通过并发线程池（并发限制数: 3）进行交叉论证校验...`,
+        type: 'info',
+      });
       db.saveTask(task);
 
-      let q = '';
-      if (rawHyp.type === 'term') {
-        q = `"${rawHyp.name}" 行业定义 ${kb.domain.name}`;
-      } else if (rawHyp.type === 'sub_industry') {
-        q = `"${rawHyp.name}" 行业 细分领域`;
-      } else {
-        q = `"${kb.domain.name}" "${rawHyp.name}" 典型业务步骤流程`;
-      }
+      // Verify 1.1 terms/sub_industries/processes with controlled concurrency pool
+      await runWithConcurrencyLimit(rawHypList1_1, 3, async (rawHyp) => {
+        if (!rawHyp || !rawHyp.name) return;
+        
+        let q = '';
+        if (rawHyp.type === 'term') {
+          q = `"${rawHyp.name}" 行业定义 ${kb.domain.name}`;
+        } else if (rawHyp.type === 'sub_industry') {
+          q = `"${rawHyp.name}" 行业 细分领域`;
+        } else {
+          q = `"${kb.domain.name}" "${rawHyp.name}" 典型业务步骤流程`;
+        }
 
-      const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
+        const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
 
-      const evaluatePrompt = `## 任务
+        const evaluatePrompt = `## 任务
 评估以下假设是否成立，并给出置信度。
 
 ## 假设
@@ -1349,58 +1414,69 @@ ${searchExplanation}
   "final_judgment": "判断依据总结文字"
 }`;
 
-      const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
-      let evalText = stripMarkdownCodeBlock(evalRes.text || '{}');
-      const evalJson = JSON.parse(evalText);
+        const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
+        const evalJson = safeParseJSON<any>(evalRes.text || '{}', {});
 
-      const conf = evalJson.confidence ?? 0.5;
-      if (evalJson.is_supported && conf >= 0.70) {
-        kb.concepts.push({
-          id: uuid('c'),
-          domainId,
-          name: rawHyp.name,
-          definition: `${rawHyp.description}。 (${evalJson.final_judgment})`,
-          attributes: rawHyp.type === 'sub_industry' ? ['子行业分支'] : ['行业通识'],
-          confidence: conf,
-          sourceUrl: sources[0]?.url || '',
-          sources: sources,
-          treeType: 'industry',
-          conceptType: 'industry_general',
-          subIndustry: rawHyp.type === 'sub_industry' ? rawHyp.name : ''
-        });
+        const conf = evalJson.confidence ?? 0.5;
+        if (evalJson.is_supported && conf >= 0.70) {
+          kb.concepts.push({
+            id: uuid('c'),
+            domainId,
+            name: rawHyp.name,
+            definition: `${rawHyp.description}。 (${evalJson.final_judgment})`,
+            attributes: rawHyp.type === 'sub_industry' ? ['子行业分支'] : ['行业通识'],
+            confidence: conf,
+            sourceUrl: sources[0]?.url || '',
+            sources: sources,
+            treeType: 'industry',
+            conceptType: 'industry_general',
+            subIndustry: rawHyp.type === 'sub_industry' ? rawHyp.name : ''
+          });
 
-        task.logs.push({
-          timestamp: new Date().toISOString(),
-          message: `✅【通识验证通过】(置信度: ${conf}): ${rawHyp.name}`,
-          type: 'success',
-        });
-      } else {
-        task.logs.push({
-          timestamp: new Date().toISOString(),
-          message: `⚠️【通识未予接纳】(置信度: ${conf}): ${rawHyp.name} (不满足 0.7 阈值)`,
-          type: 'warning',
-        });
-      }
-      db.saveDomainKB(domainId, kb);
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `✅【通识验证通过】(置信度: ${conf}): ${rawHyp.name}`,
+            type: 'success',
+          });
+        } else {
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `⚠️【通识未予接纳】(置信度: ${conf}): ${rawHyp.name} (不满足 0.7 阈值)`,
+            type: 'warning',
+          });
+        }
+        db.saveDomainKB(domainId, kb, task);
+      });
+
+      kb.checkpoints.phase1_1 = true;
+      db.saveDomainKB(domainId, kb, task);
     }
 
     // ==========================================
     // 1.2 Industry Rules & SOP (法律法规/企业SOP)
     // ==========================================
-    task.message = '正在启动 1.2: 行业标准与合规SOP规则分析提取以及大厂对标交叉校准...';
-    task.logs.push({
-      timestamp: new Date().toISOString(),
-      message: `【1.2 行业规则假设生成与验证】启动法律、合规准则、企业强时效 SOP（对标行业典型最佳实践）的采集与合规校验。`,
-      type: 'info',
-    });
-    db.saveTask(task);
+    if (kb.checkpoints.phase1_2) {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `⏭️ [断点续传] 检测到阶段 1.2 (行业标准与合规SOP规则分析) 已在之前成功完成，自动快速跳过。`,
+        type: 'info'
+      });
+      db.saveTask(task);
+    } else {
+      task.message = '正在启动 1.2: 行业标准与合规SOP规则分析提取以及大厂对标交叉校准...';
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `【1.2 行业规则假设生成与验证】启动法律、合规准则、企业强时效 SOP（对标行业典型最佳实践）的采集与合规校验。`,
+        type: 'info',
+      });
+      db.saveTask(task);
 
-    const existingRulesStr = kb.concepts
-      .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_rule')
-      .map(c => `[${c.name}]: ${c.definition}`)
-      .join('\n');
+      const existingRulesStr = kb.concepts
+        .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_rule')
+        .map(c => `[${c.name}]: ${c.definition}`)
+        .join('\n');
 
-    const prompt1_2 = `## 角色
+      const prompt1_2 = `## 角色
 你是行业合规与标准分析专家。
 
 ## 任务
@@ -1432,25 +1508,30 @@ ${existingRulesStr || '暂无'}
   }
 ]`;
 
-    const res1_2 = await generateFlexibleLLM(prompt1_2, true, task, ai, model);
-    let text1_2 = stripMarkdownCodeBlock(res1_2.text || '[]');
-    const rawHypList1_2 = JSON.parse(text1_2) as any[];
+      const res1_2 = await generateFlexibleLLM(prompt1_2, true, task, ai, model);
+      const rawHypList1_2 = safeParseJSON<any[]>(res1_2.text || '[]', []);
 
-    for (const rawHyp of rawHypList1_2) {
-      if (!rawHyp.name) continue;
-      task.message = `[1.2] 正在验证行业规则: ${rawHyp.name}`;
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `📊 共生成 ${rawHypList1_2.length} 个行业规则假设，正在通过并发线程池（并发限制数: 3）进行交叉论证校验...`,
+        type: 'info',
+      });
       db.saveTask(task);
 
-      let q = '';
-      if (rawHyp.type === 'regulation') {
-        q = `"${rawHyp.name}" 法规 强制监管 ${kb.domain.name}`;
-      } else {
-        q = `"${rawHyp.name}" SOP 操作流程 规范最佳实践`;
-      }
+      // Verify 1.2 rules in parallel
+      await runWithConcurrencyLimit(rawHypList1_2, 3, async (rawHyp) => {
+        if (!rawHyp || !rawHyp.name) return;
 
-      const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
+        let q = '';
+        if (rawHyp.type === 'regulation') {
+          q = `"${rawHyp.name}" 法规 强制监管 ${kb.domain.name}`;
+        } else {
+          q = `"${rawHyp.name}" SOP 操作流程 规范最佳实践`;
+        }
 
-      const evaluatePrompt = `## 任务
+        const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
+
+        const evaluatePrompt = `## 任务
 验证以下行业规则假设是否真实存在并被广泛认可。
 
 ## 假设
@@ -1475,202 +1556,227 @@ ${searchExplanation}
   "official_source": "官方政策规定或权威来源（含大厂SOP规范描述）"
 }`;
 
-      const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
-      let evalText = stripMarkdownCodeBlock(evalRes.text || '{}');
-      const evalJson = JSON.parse(evalText);
+        const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
+        const evalJson = safeParseJSON<any>(evalRes.text || '{}', {});
 
-      const conf = evalJson.confidence ?? 0.5;
-      const requiredThreshold = rawHyp.type === 'regulation' ? 0.80 : 0.60;
+        const conf = evalJson.confidence ?? 0.5;
+        const requiredThreshold = rawHyp.type === 'regulation' ? 0.80 : 0.60;
 
-      if (evalJson.is_valid && conf >= requiredThreshold) {
-        kb.concepts.push({
-          id: uuid('c'),
-          domainId,
-          name: rawHyp.name,
-          definition: `${rawHyp.description}。【合规出处: ${evalJson.official_source}】`,
-          attributes: [rawHyp.type === 'regulation' ? '强监管条例' : '标准作业规程SOP'],
-          confidence: conf,
-          sourceUrl: sources[0]?.url || '',
-          sources: sources,
-          treeType: 'industry',
-          conceptType: 'industry_rule'
-        });
+        if (evalJson.is_valid && conf >= requiredThreshold) {
+          kb.concepts.push({
+            id: uuid('c'),
+            domainId,
+            name: rawHyp.name,
+            definition: `${rawHyp.description}。【合规出处: ${evalJson.official_source}】`,
+            attributes: [rawHyp.type === 'regulation' ? '强监管条例' : '标准作业规程SOP'],
+            confidence: conf,
+            sourceUrl: sources[0]?.url || '',
+            sources: sources,
+            treeType: 'industry',
+            conceptType: 'industry_rule'
+          });
 
-        task.logs.push({
-          timestamp: new Date().toISOString(),
-          message: `✅【行业规则验证通过】(置信度: ${conf}, 类型: ${rawHyp.type}): ${rawHyp.name}`,
-          type: 'success',
-        });
-      } else {
-        task.logs.push({
-          timestamp: new Date().toISOString(),
-          message: `⚠️【规则淘汰】(置信度: ${conf}, 阈值: ${requiredThreshold}): ${rawHyp.name}`,
-          type: 'warning',
-        });
-      }
-      db.saveDomainKB(domainId, kb);
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `✅【行业规则验证通过】(置信度: ${conf}, 类型: ${rawHyp.type}): ${rawHyp.name}`,
+            type: 'success',
+          });
+        } else {
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `⚠️【规则淘汰】(置信度: ${conf}, 阈值: ${requiredThreshold}): ${rawHyp.name}`,
+            type: 'warning',
+          });
+        }
+        db.saveDomainKB(domainId, kb, task);
+      });
+
+      kb.checkpoints.phase1_2 = true;
+      db.saveDomainKB(domainId, kb, task);
     }
 
     // ==========================================
-    // 1.3 Industry Pain Points (行业痛点及具体现场场景)
+    // 1.3 Industry典型运营痛点、合规红线与监管处罚案例挖掘
     // ==========================================
-    task.message = '正在启动 1.3: 行业典型运营痛点、合规红线与监管处罚案例挖掘...';
-    task.logs.push({
-      timestamp: new Date().toISOString(),
-      message: `【1.3 行业痛点假设生成与验证】深入识别特定现场极易发生的违规案例、瓶颈及损失点，并与前述规则联动防范。`,
-      type: 'info',
-    });
-    db.saveTask(task);
+    if (kb.checkpoints.phase1_3) {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `⏭️ [断点续传] 检测到阶段 1.3 (行业典型运营痛点、合规红线) 已在之前成功完成，自动快速跳过。`,
+        type: 'info'
+      });
+      db.saveTask(task);
+    } else {
+      task.message = '正在启动 1.3: 行业典型运营痛点、合规红线与监管处罚案例挖掘...';
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `【1.3 行业痛点假设生成与验证】深入识别特定现场极易发生的违规案例、瓶颈及损失点，并与前述规则联动防范。`,
+        type: 'info',
+      });
+      db.saveTask(task);
 
-    const existingPainsStr = kb.concepts
-      .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_pain_point')
-      .map(c => `[${c.name}]: ${c.definition}`)
-      .join('\n');
+      const existingPainsStr = kb.concepts
+        .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_pain_point')
+        .map(c => `[${c.name}]: ${c.definition}`)
+        .join('\n');
 
-    const prompt1_3 = `## 角色
-你是行业风险分析专家，擅长发现业务中的常见问题与失败模式。
+      const prompt1_3 = `## 角色
+你是一个资深行业风控合规与损失预防专家。
 
 ## 任务
-针对【${kb.domain.name}】行业，提出一系列“行业痛点”假设。痛点应：
-- 精准具体到物理常识现场业务场景描述（例如“药师不在岗私自发售处方药导致重罚”，而非宽泛无意义的说辞）。
-- 说明风险等级（high / medium / low）。
-- 描述典型的真实处罚或重大损失发生后果。
-- 提示可能的信息化系统减缓拦截控制手段（为后续落地方案进行预备）。
+针对【${kb.domain.name}】行业，请生成一批“行业痛点与处罚案例”假设。可以是：
+- 真实的行业合规红线与监管处罚事件（如：某某企业因违反XX规定被罚款XX万）
+- 具体的现场作业重大损耗或业务流程瓶颈
+- 流通及履约环节的典型跑冒滴漏 and 欺诈风险
+
+每条风险/痛点需包含：
+- 痛点名称（具体，如：冷链断链超温损耗、违规无方销售处方药处罚）
+- 详细描述（2-3句话，明确前因后果、损失形式）
+- 监管或现场证据/参考线索
+- 初始置信度
 ${referenceArchContext}
+
 ## 已有痛点（避免重复）
 ${existingPainsStr || '暂无'}
 
 ## 输出格式
-请输出一个JSON数组，每个元素为一条假设，严禁任何 markdown 包装，直接以 [ 开始：
+请输出一个JSON数组，每个元素为一条假设，严禁 markdown 包装，直接以 [ 开始：
 [
   {
-    "name": "执业药师脱岗违规发售处方药",
-    "description": "门店药师午休或休假离岗期间，无资质的普通营业员私自接单销售处方药，面临吊销生产经营许可证、大额政务处罚风险。",
-    "risk_level": "high",
-    "typical_consequences": "面临罚款5-10万元，吊销药品零售资质，严重影响企业知名声誉。",
-    "mitigation_hints": "在门店POS结算端强制融合药师人脸识别离岗锁闭、远程CA电子审方拦截。",
-    "evidence_hint": "国家药品监督管理局公布的违规售药行政处罚法案"
+    "name": "违规无方销售处方药处罚",
+    "description": "零售药店在未留存合法处方或执业药师未审核签字的情况下，违规销售处方药。面临药监部门巨额罚款，甚至吊销营业执照风险。",
+    "evidence_hint": "国家各省市药监局典型处罚通报案例",
+    "initial_confidence": 0.95
   }
 ]`;
 
-    const res1_3 = await generateFlexibleLLM(prompt1_3, true, task, ai, model);
-    let text1_3 = stripMarkdownCodeBlock(res1_3.text || '[]');
-    const rawHypList1_3 = JSON.parse(text1_3) as any[];
+      const res1_3 = await generateFlexibleLLM(prompt1_3, true, task, ai, model);
+      const rawHypList1_3 = safeParseJSON<any[]>(res1_3.text || '[]', []);
 
-    for (const rawHyp of rawHypList1_3) {
-      if (!rawHyp.name) continue;
-      task.message = `[1.3] 正在验证行业痛点: ${rawHyp.name}`;
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `📊 共生成 ${rawHypList1_3.length} 个行业痛点与风险假设，正在通过并发线程池（并发限制数: 3）进行交叉论证校验...`,
+        type: 'info',
+      });
       db.saveTask(task);
 
-      const q = `"${kb.domain.name}" "${rawHyp.name}" 业务风险 处罚 损失 事故案例`;
-      const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
+      // Verify 1.3 pain points in parallel
+      await runWithConcurrencyLimit(rawHypList1_3, 3, async (rawHyp) => {
+        if (!rawHyp || !rawHyp.name) return;
 
-      const evaluatePrompt = `## 任务
-验证以下行业痛点是否真实存在，并在实际运营中确实发生过或属于公认的高危风险。
+        const q = `"${rawHyp.name}" 处罚 损失 事故 痛点 ${kb.domain.name}`;
+        const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
 
-## 痛点假设
-行业: ${kb.domain.name}
+        const evaluatePrompt = `## 任务
+评估以下行业痛点或处罚案例假设是否属实、普遍存在或有真实的典型历史事件支撑。
+
+## 假设
 名字: ${rawHyp.name}
-描述: ${rawHyp.description}
-风险等级: ${rawHyp.risk_level}
-潜在灾难后果: ${rawHyp.typical_consequences}
+内容: ${rawHyp.description}
 
 ## 搜索结果
 ${searchExplanation}
 
 ## 评估标准
-- 找到实际行政处罚经典通报、行业白皮书明确指明、或龙头企业内控警示：+0.5
-- 行业论坛、多方新闻媒体广泛探讨事故：+0.3
-- 纯个人推断传统没有合适事故：-0.4
+- 有国家或地方监管部门的公开处罚通告、主流媒体曝光（+0.5）
+- 多个大厂、上市公司等知名企业发生过类似重大事故或处罚（+0.3）
+- 确属行业内广泛承认的长期运营顽疾或通病（+0.2）
+- 若查无 any 监管依据或典型案例，或已被技术完全规避（-0.4）
 
-请必须且仅仅返回一个 JSON 格式，不要 markdown 包装：
+请必须而且仅返回一个 JSON 对象，杜绝 markdown 包裹形式:
 {
-  "is_real": true,
+  "is_valid": true,
   "confidence": 0.85,
-  "evidence_cases": ["实际案例摘要描述"],
-  "typical_penalty": "典型具体的赔付、罚款或红线约束损失"
+  "reference_cases": "参考案例或支撑文献依据"
 }`;
 
-      const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
-      let evalText = stripMarkdownCodeBlock(evalRes.text || '{}');
-      const evalJson = JSON.parse(evalText);
+        const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
+        const evalJson = safeParseJSON<any>(evalRes.text || '{}', {});
 
-      const conf = evalJson.confidence ?? 0.5;
-      if (evalJson.is_real && conf >= 0.60) {
-        kb.concepts.push({
-          id: uuid('c'),
-          domainId,
-          name: rawHyp.name,
-          definition: `${rawHyp.description}。【真实风险警示: ${evalJson.evidence_cases?.join('; ') || ''}。减缓对策：${rawHyp.mitigation_hints}】`,
-          attributes: [`痛点风险度: ${rawHyp.risk_level || 'high'}`],
-          confidence: conf,
-          sourceUrl: sources[0]?.url || '',
-          sources: sources,
-          treeType: 'industry',
-          conceptType: 'industry_pain_point'
-        });
+        const conf = evalJson.confidence ?? 0.5;
+        if (evalJson.is_valid && conf >= 0.70) {
+          kb.concepts.push({
+            id: uuid('c'),
+            domainId,
+            name: rawHyp.name,
+            definition: `${rawHyp.description}。【真实参考支撑: ${evalJson.reference_cases}】`,
+            attributes: ['运营痛点与处罚红线'],
+            confidence: conf,
+            sourceUrl: sources[0]?.url || '',
+            sources: sources,
+            treeType: 'industry',
+            conceptType: 'industry_pain_point'
+          });
 
-        task.logs.push({
-          timestamp: new Date().toISOString(),
-          message: `✅【成功挖掘核心痛点】(置信度: ${conf}, 风险度: ${rawHyp.risk_level}): ${rawHyp.name}`,
-          type: 'success',
-        });
-      } else {
-        task.logs.push({
-          timestamp: new Date().toISOString(),
-          message: `⚠️【痛点排除】(置信度: ${conf} 无法证实具有现实风险): ${rawHyp.name}`,
-          type: 'warning',
-        });
-      }
-      db.saveDomainKB(domainId, kb);
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `✅【行业痛点验证通过】(置信度: ${conf}): ${rawHyp.name}`,
+            type: 'success',
+          });
+        } else {
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `⚠️【痛点不予采纳】(置信度: ${conf}): ${rawHyp.name}`,
+            type: 'warning',
+          });
+        }
+        db.saveDomainKB(domainId, kb, task);
+      });
+
+      kb.checkpoints.phase1_3 = true;
+      db.saveDomainKB(domainId, kb, task);
     }
 
     // ==========================================
-    // 1.4 Sub-industry Recursion (子行业递归下钻)
+    // 1.4 Sub-industry Vertical Deep Dive Recursion (子行业递归)
     // ==========================================
-    task.message = '正在启动 1.4: 二级子行业链路下钻与递归行业树精细化学术推演...';
-    task.logs.push({
-      timestamp: new Date().toISOString(),
-      message: `【1.4 子行业递归】正在扫描行业探索过程中发现的特异细分行业。`,
-      type: 'info',
-    });
-    db.saveTask(task);
-
-    // Get sub industries from newly verified concepts
-    const subIndustries = kb.concepts
-      .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_general' && c.attributes.includes('子行业分支'))
-      .map(c => c.name);
-
-    if (subIndustries.length > 0) {
-      const maxSubDomainsPerLevel = (config as any).max_sub_domains_per_level || 2;
-      const targetSubs = subIndustries.slice(0, maxSubDomainsPerLevel);
-
+    if (kb.checkpoints.phase1_4) {
       task.logs.push({
         timestamp: new Date().toISOString(),
-        message: `🔎 探测到以下子行业分支：[${subIndustries.join(', ')}]。系统将深度递归分析其中最具特异性的前 ${targetSubs.length} 个子域名：[${targetSubs.join(', ')}]，探索其专有的特殊术语、SOP合规规则与特有痛点。`,
+        message: `⏭️ [断点续传] 检测到阶段 1.4 (垂直子行业递归建树) 已在之前成功完成，自动快速跳过。`,
+        type: 'info'
+      });
+      db.saveTask(task);
+    } else {
+      task.message = '正在启动 1.4: 垂直子行业递归建树与差异化高阶资产对齐...';
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `【1.4 垂直子行业递归建树】识别二级差异化细分并注入特异性资产。`,
         type: 'info',
       });
       db.saveTask(task);
 
-      for (const sub of targetSubs) {
+      // Get sub-industries from concepts (e.g. from 1.1 or 1.2 or 1.3)
+      const subIndustries = Array.from(new Set(
+        kb.concepts
+          .filter(c => c.treeType === 'industry' && c.subIndustry && c.subIndustry.trim().length > 0)
+          .map(c => c.subIndustry.trim())
+      ));
+
+      if (subIndustries.length > 0) {
         task.logs.push({
           timestamp: new Date().toISOString(),
-          message: `⏳ 递归下钻子域名: 【${sub}】。正在导入父级事实事实数据库作为继承事实，剔除父行业通识防止冗余...`,
+          message: `🔍 识别到 ${subIndustries.length} 个特异性子行业分支：${subIndustries.join(', ')}。启动垂直细分资产自动下钻对齐。`,
           type: 'info',
         });
         db.saveTask(task);
 
-        const promptSub = `## 角色
-你是高精度的垂直细分行业 [${sub}] 的行业专家。你正在对 [${kb.domain.name}] 下的子行业 [${sub}] 进行特异名词和特殊规则痛点补充。
+        // Run sub-industry assets补充 in parallel (controlled limit: 2)
+        await runWithConcurrencyLimit(subIndustries, 2, async (sub) => {
+          task.message = `[1.4] 正在为垂直细分 [${sub}] 补充特色术语、特殊SOP及现场痛点...`;
+          db.saveTask(task);
+
+          const promptSub = `## 角色
+你是一个资深行业分析与微观场景还原专家。
 
 ## 任务
-请专门针对细分方向【${sub}】，生成该场景特有的：
-1. 2 个特殊业务术语（例如医药零售特有的“非处方药双通道流转”）
+在【${kb.domain.name}】行业下的二级细分领域【${sub}】中，请补充专属于该二级细分的：
+1. 1 条特色核心术语（如“双通道流转”）
 2. 1 条特殊的龙头企业 SOP 规范
 3. 1 个独有的物理痛点及处罚边界
 ${referenceArchContext}
+
 ## 核心事实继承原则
-子细分行业已包含父级行业的所有基本常识，不要生成任何和父类 【${kb.domain.name}】 相同的冗余通用表达！
+子细分行业已包含父级行业的所有基本常识，不要生成 any 和父类 【${kb.domain.name}】 相同的冗余通用表达！
 
 ## 输出格式
 请输出一个JSON格式对象，包含 concepts 数组，严禁 markdown 包装：
@@ -1685,50 +1791,53 @@ ${referenceArchContext}
   ]
 }`;
 
-        try {
-          const resSub = await generateFlexibleLLM(promptSub, true, task, ai, model);
-          let textSub = stripMarkdownCodeBlock(resSub.text || '{}');
-          const parsedSub = JSON.parse(textSub);
+          try {
+            const resSub = await generateFlexibleLLM(promptSub, true, task, ai, model);
+            const parsedSub = safeParseJSON<any>(resSub.text || '{}', {});
 
-          if (parsedSub && Array.isArray(parsedSub.concepts)) {
-            let subCount = 0;
-            for (const item of parsedSub.concepts) {
-              if (!item.name) continue;
-              // Check dupes
-              const dupe = kb.concepts.find(c => c.name.toLowerCase() === item.name.toLowerCase());
-              if (!dupe) {
-                kb.concepts.push({
-                  id: uuid('c'),
-                  domainId,
-                  name: item.name,
-                  definition: `${item.definition || ''} (属于二级细分: ${sub})`,
-                  attributes: [...(item.attributes || []), `子领域:${sub}`],
-                  confidence: 0.85,
-                  treeType: 'industry',
-                  conceptType: item.conceptType || 'industry_general',
-                  subIndustry: sub
-                });
-                subCount++;
+            if (parsedSub && Array.isArray(parsedSub.concepts)) {
+              let subCount = 0;
+              for (const item of parsedSub.concepts) {
+                if (!item.name) continue;
+                // Check dupes
+                const dupe = kb.concepts.find(c => c.name.toLowerCase() === item.name.toLowerCase());
+                if (!dupe) {
+                  kb.concepts.push({
+                    id: uuid('c'),
+                    domainId,
+                    name: item.name,
+                    definition: `${item.definition || ''} (属于二级细分: ${sub})`,
+                    attributes: [...(item.attributes || []), `子领域:${sub}`],
+                    confidence: 0.85,
+                    treeType: 'industry',
+                    conceptType: item.conceptType || 'industry_general',
+                    subIndustry: sub
+                  });
+                  subCount++;
+                }
               }
+              task.logs.push({
+                timestamp: new Date().toISOString(),
+                message: `🌟 【子行业递归成功】成功为子域名【${sub}】补充注入 ${subCount} 条专属的高阶特有行业资产。`,
+                type: 'success',
+              });
+              db.saveDomainKB(domainId, kb, task);
             }
-            task.logs.push({
-              timestamp: new Date().toISOString(),
-              message: `🌟 【子行业递归成功】成功为子域名【${sub}】补充注入 ${subCount} 条专属的高阶特有行业资产。`,
-              type: 'success',
-            });
-            db.saveDomainKB(domainId, kb);
+          } catch (subErr: any) {
+            console.error(`Sub-recursion failed for ${sub}:`, subErr);
           }
-        } catch (subErr: any) {
-          console.error(`Sub-recursion failed for ${sub}:`, subErr);
-        }
+        });
+      } else {
+        task.logs.push({
+          timestamp: new Date().toISOString(),
+          message: `ℹ️ 本轮未探查到明确需要独立建树的二级子行业分支，自然结束 1.4 子细分递归。`,
+          type: 'info',
+        });
+        db.saveTask(task);
       }
-    } else {
-      task.logs.push({
-        timestamp: new Date().toISOString(),
-        message: `ℹ️ 本轮未探查到明确需要独立建树的二级子行业分支，自然结束 1.4 子细分递归。`,
-        type: 'info',
-      });
-      db.saveTask(task);
+
+      kb.checkpoints.phase1_4 = true;
+      db.saveDomainKB(domainId, kb, task);
     }
 
   } catch (err: any) {
@@ -1759,11 +1868,12 @@ ${referenceArchContext}
       db.saveTask(task);
 
       const maxRounds = config.iteration.maxRounds || 3;
-      let currentRound = 1;
+      kb.checkpoints.phase2_round = kb.checkpoints.phase2_round || 1;
+      let currentRound = kb.checkpoints.phase2_round;
 
       while (currentRound <= maxRounds) {
         task.currentRound = currentRound;
-        task.message = `[Phase 2 - Round ${currentRound}/${maxRounds}] 正在多企业、全场景对标识别系统核心空缺...`;
+        task.message = `[Phase 2 - Round ${currentRound}/${maxRounds}] 正在多企业、全场景进行“盲区驱动”高敏捷建模...`;
         task.logs.push({
           timestamp: new Date().toISOString(),
           message: `================ 启动系统核心架构 iteration [Round ${currentRound}] ================`,
@@ -1771,55 +1881,129 @@ ${referenceArchContext}
         });
         db.saveTask(task);
 
-        // Define multi-company prompt for hypothesis generation
-        const promptGaps = `你是一个天才企业系统分析师与顶级架构师。我们正在为 ${kb.domain.name} (系统标识: ${kb.domain.systemName}) 执行【双轨复合系统领域树】建模。
-目前，你的对标系统涵盖中国最领先企业的主流微服务及核心子系统组合：【美团核心交易/履约调度系统、阿里淘宝天猫大型交易/采购底座、京东物流/供应链/精细订单网络、腾讯大规模结算平台、字节跳动中台架构与推送调度】。
-Your modeling must align with their systems, APIs, and supervision rules.
-${referenceArchContext}
-已知的行业知识概念事实：
-- 行业通识: ${kb.concepts.filter(c => c.treeType === 'industry' && c.conceptType === 'industry_general').map(x=>x.name).join(', ') || '暂无'}
-- 现有系统聚合根: ${kb.aggregates.map(a => a.name).join(', ') || '暂无'}
-- 核心技术实体: ${kb.entities.map(e => e.name).join(', ')}
+        // 1. Scan for gaps first using state perception scanner
+        const gaps = scanKnowledgeGaps(kb);
 
-请审视多大厂核心资产，通过以下三维权重指导核心架构：
-- **执行流 (Execution, 40%)**: 偏向大厂的高吞吐基础交易操作、事件和单据流转。
-- **监管流 (Supervision, 40%)**: 偏向多层财务拦截机制、行政及业务底牌风控防火墙、大厂标准的核审闸路（例如阿里的资质拦截或腾讯的实物拦截）。
-- **数据统计/汇总流 (Statistics, 20%)**: 用于看盘 analysis、周期看盘汇总、趋势分析。
+        // Filter out isolated nodes that have already failed search 3 times,
+        // and filter out gaps whose paths have already been processed in previous rounds
+        kb.isolatedNodeSearchAttempts = kb.isolatedNodeSearchAttempts || {};
+        (kb as any).processedGapPaths = (kb as any).processedGapPaths || [];
+        const activeGaps = gaps.filter(gap => {
+          if ((kb as any).processedGapPaths.includes(gap.target_path)) {
+            return false; // Skip already addressed gaps to ensure incremental updates
+          }
+          if (gap.target_path.includes('知识孤岛')) {
+            const nodeName = gap.metadata?.entityName || '';
+            const attempts = kb.isolatedNodeSearchAttempts[nodeName] || 0;
+            if (attempts >= 3) {
+              return false; // Skip this isolated node as it has been searched 3 times with no high confidence relations
+            }
+          }
+          return true;
+        });
 
-请生成最多 3 个需要进一步联网求证或推理验证的深度“系统级高可信假设命题”，注意要跟大厂的最佳系统做对比验证（例如：“美团即时履约系统中的实时调度拦截...”、“阿里的高精度多端同步规则...”）。
+        task.logs.push({
+          timestamp: new Date().toISOString(),
+          message: `📊 [状态感知扫描完成] 发现当前知识大盘存在 ${gaps.length} 个盲区缺陷。在过滤已被确认 3 次判定查无关系的独立孤岛后，本次有效新盲区 ${activeGaps.length} 个。`,
+          type: 'info',
+        });
 
-请按 JSON 数组严格返回，千万不能有 Markdown 包裹：
-[
-  {
-    "statement": "对标美团即时履约与京东干线运输中控管理，本系统必须在核心调度事务环节增加‘配送波次在途异常双重校验’监管，以保障跨大区调拨履约交付率。",
-    "type": "best_practice_gap",
-    "reason": "美团/阿里均配备了极高的物流配送超时防火墙与降级罚金统计机制，这是现代超重载荷高一致性体系的标准。"
-  }
-]`;
+        // Track search attempts for isolated nodes in active gaps
+        activeGaps.forEach(gap => {
+          if (gap.target_path.includes('知识孤岛')) {
+            const nodeName = gap.metadata?.entityName || '';
+            kb.isolatedNodeSearchAttempts[nodeName] = (kb.isolatedNodeSearchAttempts[nodeName] || 0) + 1;
+            task.logs.push({
+              timestamp: new Date().toISOString(),
+              message: `🔍【知识孤岛溯源计数】正在对孤离实体 [${nodeName}] 进行第 ${kb.isolatedNodeSearchAttempts[nodeName]}/3 次深度大厂关联探测与外接契约编织...`,
+              type: 'warning',
+            });
+          }
+        });
+        db.saveDomainKB(domainId, kb, task);
 
-        const hypResponse = await generateFlexibleLLM(promptGaps, true, task, ai, model);
-        let rawHypText = stripMarkdownCodeBlock(hypResponse.text || '[]');
-        const rawHypList = JSON.parse(rawHypText) as any[];
+        // Check early convergence (DOD termination condition)
+        // DOD 1: Consecutive 2 rounds of scanner find < 3 gaps, and core aggregate 3D coverage > 90%
+        let totalAggregates = kb.aggregates.length;
+        let coverCount = 0;
+        kb.aggregates.forEach(ar => {
+          if (ar.capExecution && ar.capSupervision && ar.capStatistics) {
+            coverCount++;
+          }
+        });
+        const coverageRate = totalAggregates > 0 ? (coverCount / totalAggregates) : 1.0;
 
-        const newlyGeneratedHypotheses: Hypothesis[] = rawHypList.map((h, i) => ({
-          id: `h_${Date.now()}_ph2_${currentRound}_${i}`,
-          domainId,
-          statement: h.statement,
-          type: h.type as any,
-          status: 'pending',
-          confidence: 0.5,
-          reason: h.reason,
-          createdAt: new Date().toISOString(),
-        }));
+        task.logs.push({
+          timestamp: new Date().toISOString(),
+          message: `📈 [收敛率评估] 当前核心限界聚合根三维能力覆盖率: ${(coverageRate * 100).toFixed(1)}% (已覆盖: ${coverCount}/${totalAggregates})。`,
+          type: 'info',
+        });
 
-        kb.hypotheses.push(...newlyGeneratedHypotheses);
-        db.saveDomainKB(domainId, kb);
+        if (currentRound > 1) {
+          const prevRoundGaps = (task as any).prevRoundGapsCount || 99;
+          if (gaps.length < 3 && prevRoundGaps < 3 && coverageRate >= 0.90) {
+            task.logs.push({
+              timestamp: new Date().toISOString(),
+              message: `🎉【提前收敛-DOD达成】检测到连续 2 轮有效业务盲区低于 3 个，且核心限界聚合根三维场景覆盖率达到 ${(coverageRate * 100).toFixed(1)}% (已达到 90% DOD要求)，系统认知完美闭环，提前终止自动迭代！`,
+              type: 'success',
+            });
+            db.saveTask(task);
+            break; // Exit the loop!
+          }
+        }
+        (task as any).prevRoundGapsCount = gaps.length;
+        db.saveTask(task);
+
+        // 2. Targeted Hypothesis Generator
+        let newlyGeneratedHypotheses = kb.hypotheses.filter(h => h.id.includes(`_ph2_${currentRound}_`));
+
+        if (newlyGeneratedHypotheses.length === 0) {
+          const promptGaps = getTargetedHypothesesPrompt(kb, activeGaps, config);
+          const hypResponse = await generateFlexibleLLM(promptGaps, true, task, ai, model);
+          const rawHypList = safeParseJSON<any[]>(hypResponse.text || '[]', []);
+
+          // Mark the top gaps as processed to avoid repeating them in future rounds
+          activeGaps.slice(0, 8).forEach(g => {
+            if (!(kb as any).processedGapPaths.includes(g.target_path)) {
+              (kb as any).processedGapPaths.push(g.target_path);
+            }
+          });
+
+          newlyGeneratedHypotheses = rawHypList.map((h, i) => ({
+            id: `h_${Date.now()}_ph2_${currentRound}_${i}`,
+            domainId,
+            statement: h.statement,
+            type: h.type as any,
+            status: 'pending',
+            confidence: 0.5,
+            reason: h.reason,
+            createdAt: new Date().toISOString(),
+          }));
+
+          kb.hypotheses.push(...newlyGeneratedHypotheses);
+          db.saveDomainKB(domainId, kb, task);
+        } else {
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `⏭️ [断点续传] 检测到第 ${currentRound} 轮已存在未完成验证的系统设计假设，直接恢复验证流程。`,
+            type: 'info'
+          });
+          db.saveTask(task);
+        }
 
         const verifiedHypList: Hypothesis[] = [];
         const perRoundLimit = Math.min(newlyGeneratedHypotheses.length, 3);
+        const hypToVerify = newlyGeneratedHypotheses.slice(0, perRoundLimit);
 
-        for (let i = 0; i < perRoundLimit; i++) {
-          const hyp = newlyGeneratedHypotheses[i];
+        // Run hypothesis verification in parallel (concurrency limit: 2)
+        await runWithConcurrencyLimit(hypToVerify, 2, async (hyp) => {
+          if (hyp.status !== 'pending') {
+            if (hyp.status === 'verified' && hyp.confidence >= 0.70) {
+              verifiedHypList.push(hyp);
+            }
+            return;
+          }
+
           task.message = `[Phase 2 - Round ${currentRound}] 正在验证系统假设: "${hyp.statement.substring(0, 24)}..."`;
           task.logs.push({
             timestamp: new Date().toISOString(),
@@ -1839,7 +2023,7 @@ ${referenceArchContext}
 【业界大中型企业检索论证陈述】:
 ${searchExplanation}
 
-判定规则：如果该模式是对标阿里、美团、京东、腾讯、字节等任何一家或多家已确认、广泛采用、保障高并发高可靠的标准业务架构最佳实践，请将 status 标记为 "verified"，得高置信度。
+判定规则：如果该模式是对标阿里、美团、京东、腾讯、字节等任何一家或多家已确认、广泛采用、保障高并发高可靠的标准业务架构最佳实践，请将 status 标记为 "verified"，得高置信度.
 必须仅仅返回一个 JSON 格式对象，不要代码子块包装：
 {
   "status": "verified" | "rejected",
@@ -1848,8 +2032,7 @@ ${searchExplanation}
 }`;
 
           const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
-          let evalRaw = stripMarkdownCodeBlock(evalRes.text || '{}');
-          const evalJson = JSON.parse(evalRaw);
+          const evalJson = safeParseJSON<any>(evalRes.text || '{}', {});
 
           const targetHyp = kb.hypotheses.find(h => h.id === hyp.id);
           if (targetHyp) {
@@ -1873,12 +2056,12 @@ ${searchExplanation}
                 type: 'warning',
               });
             }
-            db.saveDomainKB(domainId, kb);
+            db.saveDomainKB(domainId, kb, task);
           }
-        }
+        });
 
-        // Apply Deduction and extract aggregates, entities, constraints and 3D scenarios
-        for (const verifiedHyp of verifiedHypList) {
+        // Apply Deduction and extract aggregates, entities, constraints and 3D scenarios in parallel (concurrency limit: 2)
+        await runWithConcurrencyLimit(verifiedHypList, 2, async (verifiedHyp) => {
           task.message = `[Phase 2 - Round ${currentRound}] 正在基于大厂对齐数据演绎推推导软件与事务架构核心细节...`;
           task.logs.push({
             timestamp: new Date().toISOString(),
@@ -1889,18 +2072,22 @@ ${searchExplanation}
 
           const inferPrompt = getInferencePrompt(verifiedHyp, kb, config);
           const inferRes = await generateFlexibleLLM(inferPrompt, true, task, ai, model);
-          let inferText = stripMarkdownCodeBlock(inferRes.text || '{}');
-          const derived = JSON.parse(inferText);
+          const derived = safeParseJSON<any>(inferRes.text || '{}', {});
 
-          const counts = mergeDerivedKnowledge(kb, derived);
+          // Apply Causal Derivation Booster (因果推演逻辑链补齐)
+          applyCausalDerivationBooster(kb, derived, verifiedHyp);
+
+          const counts = mergeDerivedKnowledge(kb, derived, task);
           task.logs.push({
             timestamp: new Date().toISOString(),
-            message: `💡【架构演绎成功】成功构建并丰富大盘：新增技术聚合根 ${counts.aggregates} 个，核心方法及代码级实体关联 ${counts.entities} 个，注入三维业务应用场景 ${counts.scenarios} 个。`,
+            message: `💡【架构演绎与因果融合成功】通过大厂双向对标：新增核心限界聚合根 ${counts.aggregates} 个，核心方法及代码实体关联 ${counts.entities} 个，业务二级模块 ${counts.modules} 个，三级细节要素 ${counts.elements} 个，双向系统级交互契约 ${counts.interactions} 个，合并注入三维能力模型场景 ${counts.scenarios} 个。`,
             type: 'success',
           });
-          db.saveDomainKB(domainId, kb);
-        }
+          db.saveDomainKB(domainId, kb, task);
+        });
 
+        kb.checkpoints.phase2_round = currentRound + 1;
+        db.saveDomainKB(domainId, kb, task);
         currentRound++;
       }
     } catch (err: any) {
@@ -2056,21 +2243,441 @@ ${referenceArchContext}
 }
 
 
-// Merge logic and avoid duplicate names
-function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
+// ==========================================
+// GAP-DRIVEN INCREMENTAL INFERENCE ENGINE (盲区驱动的增量推理引擎)
+// ==========================================
+
+interface Gap {
+  gap_type: 'L1' | 'L2' | 'L3' | 'L4';
+  target_path: string;
+  description: string;
+  priority: number;
+  metadata?: any;
+}
+
+function getJaroWinklerSimilarity(s1: string, s2: string): number {
+  s1 = s1.toLowerCase().trim();
+  s2 = s2.toLowerCase().trim();
+  if (s1 === s2) return 1.0;
+  if (s1.length === 0 || s2.length === 0) return 0.0;
+
+  const range = Math.floor(Math.max(s1.length, s2.length) / 2) - 1;
+  const s1Matches = new Array(s1.length).fill(false);
+  const s2Matches = new Array(s2.length).fill(false);
+
+  let m = 0;
+  for (let i = 0; i < s1.length; i++) {
+    const start = Math.max(0, i - range);
+    const end = Math.min(i + range + 1, s2.length);
+    for (let j = start; j < end; j++) {
+      if (!s2Matches[j] && s1[i] === s2[j]) {
+        s1Matches[i] = true;
+        s2Matches[j] = true;
+        m++;
+        break;
+      }
+    }
+  }
+
+  if (m === 0) return 0.0;
+
+  let t = 0;
+  let k = 0;
+  for (let i = 0; i < s1.length; i++) {
+    if (s1Matches[i]) {
+      while (!s2Matches[k]) k++;
+      if (s1[i] !== s2[k]) t++;
+      k++;
+    }
+  }
+
+  const jaro = (m / s1.length + m / s2.length + (m - t / 2) / m) / 3;
+  const p = 0.1;
+  let l = 0;
+  while (l < Math.min(4, s1.length, s2.length) && s1[l] === s2[l]) {
+    l++;
+  }
+  return jaro + l * p * (1 - jaro);
+}
+
+function calculateSimilarity(s1: string, s2: string): number {
+  if (!s1 || !s2) return 0;
+  const name1 = s1.toLowerCase().trim().replace(/[\s_\-（）\(\)]/g, '');
+  const name2 = s2.toLowerCase().trim().replace(/[\s_\-（）\(\)]/g, '');
+  if (name1 === name2) return 1.0;
+
+  // If one contains the other and length ratio is high, return high similarity
+  if (name1.includes(name2) || name2.includes(name1)) {
+    const lenRatio = Math.min(name1.length, name2.length) / Math.max(name1.length, name2.length);
+    if (lenRatio > 0.5) {
+      return 0.8 + lenRatio * 0.15; // 0.88 - 0.95
+    }
+  }
+
+  return getJaroWinklerSimilarity(name1, name2);
+}
+
+function scanKnowledgeGaps(kb: KB_Store): Gap[] {
+  const gaps: Gap[] = [];
+  const systemNameLower = (kb.domain.systemName || '').trim().toLowerCase();
+  const isIndustryOnly = !systemNameLower || ['无', 'none', 'industry', '纯行业', '行业', '无系统', '暂无系统'].includes(systemNameLower);
+
+  // L1: Structural missing (六维模板维度空置率扫描)
+  if (kb.concepts.length < 5) {
+    gaps.push({
+      gap_type: 'L1',
+      target_path: '行业树/通用常识概念',
+      description: '通用业务概念字典中概念少于 5 个，基础行业术语支撑不足。',
+      priority: 1,
+    });
+  }
+
+  if (!isIndustryOnly) {
+    if (kb.aggregates.length < 2) {
+      gaps.push({
+        gap_type: 'L1',
+        target_path: '系统树/技术聚合根',
+        description: '限界上下文或领域聚合根数量过少（不足 2 个），核心软件架构模型不完整。',
+        priority: 1,
+      });
+    }
+
+    if (kb.entities.length < 3) {
+      gaps.push({
+        gap_type: 'L1',
+        target_path: '系统树/技术实体',
+        description: '数据库核心实体与代码层模型（如表、状态字段）极度匮乏，架构下钻深度不够。',
+        priority: 1,
+      });
+    }
+
+    if (!kb.modules || kb.modules.length < 2) {
+      gaps.push({
+        gap_type: 'L1',
+        target_path: '系统树/二级核心模块',
+        description: '系统整体缺失二级领域核心业务模块规划。',
+        priority: 1,
+      });
+    }
+
+    if (!kb.elements || kb.elements.length < 3) {
+      gaps.push({
+        gap_type: 'L1',
+        target_path: '系统树/三级特征子要素',
+        description: '核心二级模块下层，缺失具体细节三级业务和技术算子/特征细节。',
+        priority: 1,
+      });
+    }
+
+    if (!kb.interactions || kb.interactions.length < 2) {
+      gaps.push({
+        gap_type: 'L1',
+        target_path: '系统树/接口系统双向交互契约',
+        description: '系统与外部系统边界交互定义少于 2 个，上下游契约链路不明晰。',
+        priority: 1,
+      });
+    }
+  }
+
+  // L2: Process rupture (三维能力矩阵 {execution, supervision, statistics} 断层)
+  if (!isIndustryOnly) {
+    for (const ar of kb.aggregates) {
+      const arScenarios = kb.scenarios.filter(s => s.aggregateRootId === ar.id);
+      
+      const hasExecution = arScenarios.some(s => s.capabilityDimension === 'execution');
+      const hasSupervision = arScenarios.some(s => s.capabilityDimension === 'supervision');
+      const hasStatistics = arScenarios.some(s => s.capabilityDimension === 'statistics');
+
+      if (!hasExecution) {
+        gaps.push({
+          gap_type: 'L2',
+          target_path: `系统树/聚合根/${ar.name}/业务场景/执行流`,
+          description: `聚合根 [${ar.name}] 完全缺失“执行流 (Execution)”相关的业务操作或单据流转，无法支撑基本业务。`,
+          priority: 2,
+          metadata: { arId: ar.id, arName: ar.name, dimension: 'execution' },
+        });
+      }
+      if (!hasSupervision) {
+        gaps.push({
+          gap_type: 'L2',
+          target_path: `系统树/聚合根/${ar.name}/业务场景/监管流`,
+          description: `聚合根 [${ar.name}] 缺失“监管流 (Supervision)”相关的审批、资质拦截或红线风控闸路，安全合规存在漏洞。`,
+          priority: 2,
+          metadata: { arId: ar.id, arName: ar.name, dimension: 'supervision' },
+        });
+      }
+      if (!hasStatistics) {
+        gaps.push({
+          gap_type: 'L2',
+          target_path: `系统树/聚合根/${ar.name}/业务场景/统计流`,
+          description: `聚合根 [${ar.name}] 缺失“数据统计/汇总流 (Statistics)”相关的看盘报表、趋势预测或周期统计，缺乏经营量化手段。`,
+          priority: 2,
+          metadata: { arId: ar.id, arName: ar.name, dimension: 'statistics' },
+        });
+      }
+    }
+  }
+
+  // L3: Causal rupture (因果断层 & 知识孤岛)
+  // Check entities with state fields
+  if (!isIndustryOnly) {
+    for (const entity of kb.entities) {
+      const hasStateField = entity.fields && entity.fields.some(f => 
+        /status|state|stage|type|code|状态|阶段|类型/i.test(f.name) || 
+        /status|state|stage|type|code|状态|阶段|类型/i.test(f.description)
+      );
+      if (hasStateField) {
+        const hasLifecycleProcess = kb.processes.some(p => 
+          p.name.toLowerCase().includes(entity.name.toLowerCase()) || 
+          p.steps.some(s => s.toLowerCase().includes(entity.name.toLowerCase()))
+        ) || kb.rules.some(r => 
+          r.name.toLowerCase().includes(entity.name.toLowerCase()) || 
+          r.rule.toLowerCase().includes(entity.name.toLowerCase())
+        );
+
+        if (!hasLifecycleProcess) {
+          gaps.push({
+            gap_type: 'L3',
+            target_path: `系统树/实体/${entity.name}/生命周期`,
+            description: `实体 [${entity.name}] 具有状态/类型字段，但未关联任何状态机、流转流程规范、或状态变更日志逻辑。`,
+            priority: 3,
+            metadata: { entityId: entity.id, entityName: entity.name },
+          });
+        }
+      }
+
+      // Check for Knowledge Islands: Entity with no Aggregate Root association
+      if (!entity.aggregateRootId) {
+        gaps.push({
+          gap_type: 'L3',
+          target_path: `系统树/实体/${entity.name}/知识孤岛`,
+          description: `技术实体 [${entity.name}] 未归属或挂载到任何聚合根上，处于“知识孤岛”游离状态。`,
+          priority: 3,
+          metadata: { entityId: entity.id, entityName: entity.name },
+        });
+      }
+    }
+
+    // Check aggregate roots with missing Repository/Factory or CoreLogic Rules
+    for (const ar of kb.aggregates) {
+      const hasRules = kb.rules.some(r => r.aggregateRootId === ar.id);
+      if (!hasRules) {
+        gaps.push({
+          gap_type: 'L3',
+          target_path: `系统树/聚合根/${ar.name}/核心规则`,
+          description: `聚合根 [${ar.name}] 缺少任何关联的核心不变性（Invariant）约束、核验规则、或业务执行逻辑。`,
+          priority: 3,
+          metadata: { arId: ar.id, arName: ar.name },
+        });
+      }
+    }
+  }
+
+  // L4: Confidence depression (置信度洼地)
+  for (const c of kb.concepts) {
+    if (c.confidence < 0.6) {
+      gaps.push({
+        gap_type: 'L4',
+        target_path: `行业树/概念/${c.name}`,
+        description: `概念 [${c.name}] 置信度较低 (${c.confidence})，急需通过更权威的大厂比对和搜索引擎来论证、重新评估或补充细节属性。`,
+        priority: 4,
+        metadata: { conceptId: c.id, conceptName: c.name },
+      });
+    }
+  }
+
+  return gaps.sort((a, b) => a.priority - b.priority);
+}
+
+function getTargetedHypothesesPrompt(kb: KB_Store, gaps: Gap[], config: GeneratorConfig): string {
+  const gapDescriptions = gaps.slice(0, 8).map((g, i) => `${i + 1}. 【${g.gap_type}级盲区 - ${g.target_path}】: ${g.description}`).join('\n');
+  const systemNameLower = (kb.domain.systemName || '').trim().toLowerCase();
+  const isIndustryOnly = !systemNameLower || ['无', 'none', 'industry', '纯行业', '行业', '无系统', '暂无系统'].includes(systemNameLower);
+
+  let referenceArchContext = '';
+  const ref = (config as any)?.referenceArch;
+  if (ref) {
+    const parts: string[] = [];
+    if (ref.companyArchitecture && ref.companyArchitecture.trim()) {
+      parts.push(`【参考：公司架构信息】:\n${ref.companyArchitecture.trim()}`);
+    }
+    if (ref.productArchitecture && ref.productArchitecture.trim()) {
+      parts.push(`【参考：现有产品架构】:\n${ref.productArchitecture.trim()}`);
+    }
+    if (ref.keyDirections && ref.keyDirections.trim()) {
+      parts.push(`【重点补全的方向/倾向性】:\n${ref.keyDirections.trim()}`);
+    }
+    if (parts.length > 0) {
+      referenceArchContext = `\n## 导入的参考架构与重点方向 (Optional Reference Architecture)
+以下是用户导入的现有公司架构、产品架构或重点补全的方向。请以此作为最高优先级“盲区需求”重点补充：
+${parts.join('\n\n')}\n`;
+    }
+  }
+
+  return `你是一个天才企业系统分析师与顶级架构师。我们正在为 ${kb.domain.name} (系统标识: ${kb.domain.systemName}) 执行【双轨复合系统领域树】建模。
+目前，你的对标系统涵盖中国最领先企业的主流微服务及核心子系统组合：【美团核心交易/履约调度系统、阿里淘宝天猫大型交易/采购底座、京东物流/供应链/精细订单网络、腾讯大规模结算平台、字节跳动中台架构与推送调度】。
+Your modeling must align with their systems, APIs, and supervision rules.
+
+我们应用了“状态感知”与“盲区驱动”的高敏捷建模引擎。经系统深度红外线扫描，发现当前知识库存在以下核心【知识盲区（Gaps）】：
+${gapDescriptions || '（无明显盲区，说明系统结构非常完整。请针对已有知识进行高阶下钻推导）'}
+${referenceArchContext}
+
+【已有知识摘要（避免重复推演）】：
+- 已验证概念: ${kb.concepts.filter(c => c.treeType === 'industry').map(x => x.name).join(', ') || '暂无'}
+- 现有聚合根: ${kb.aggregates.map(a => a.name).join(', ') || '暂无'}
+- 技术实体: ${kb.entities.map(e => e.name).join(', ') || '暂无'}
+- 已有业务场景: ${kb.scenarios.map(s => s.name).join(', ') || '暂无'}
+
+【具体任务】：
+请仅针对上述扫描出来的最优先的前几个【盲区/漏洞（Gaps）】，提出最多 3 条针对性极强、用以“查漏补缺”的系统级或行业级高可信假设命题。
+千万不要生成与已有知识相同或极度类似的假设。要突出与大厂（如阿里、美团、京东等）的高精尖架构作对标。
+
+请按 JSON 数组严格返回，千万不能有 Markdown 格式包裹，必须直接以 [ 开始：
+[
+  {
+    "statement": "对标美团即时履约与京东干线运输中控管理，本系统必须在核心调度事务环节增加‘配送波次在途异常双重校验’监管，以保障跨大区调拨履约交付率。",
+    "type": "best_practice_gap",
+    "reason": "解决 [配送波次] 聚合根缺失“监管流”应用场景的 L2 级流程断裂，确保高腐损痛点下的在途质量安全。"
+  }
+]`;
+}
+
+function applyCausalDerivationBooster(kb: KB_Store, derived: any, hypothesis: Hypothesis) {
+  if (!derived) return;
+  if (!derived.rules) derived.rules = [];
+  if (!derived.entities) derived.entities = [];
+  if (!derived.scenarios) derived.scenarios = [];
+  if (!derived.processes) derived.processes = [];
+  if (!derived.interactions) derived.interactions = [];
+
+  const textToScan = (hypothesis.statement + ' ' + hypothesis.reason + ' ' + JSON.stringify(derived)).toLowerCase();
+
+  // Rule 1: Aggregate Root created -> ensure repository & factory rules are present
+  if (Array.isArray(derived.aggregates)) {
+    for (const ar of derived.aggregates) {
+      if (!ar.name) continue;
+      const alreadyHasRule = derived.rules.some((r: any) => r.aggregateRootName === ar.name || (r.rule && r.rule.includes(ar.name)));
+      if (!alreadyHasRule) {
+        derived.rules.push({
+          aggregateRootName: ar.name,
+          name: `${ar.name}仓储层高一致性事务边界控制规则 (Repository Invariant)`,
+          rule: `每一个对 [${ar.name}] 聚合根的持久化操作都必须严格通过统一的仓储接口进行原子事务管理，限制分布式脏写和并发竞态。`,
+          implementationHint: `在高并发大厂对标架构下，必须采用悲观排他锁或 Redis 分布式红锁 (Redlock) 加快前置拦截和防重入。`,
+        });
+      }
+    }
+  }
+
+  // Rule 2: Entity has status field -> derive State Machine process & Audit log
+  if (Array.isArray(derived.entities)) {
+    for (const ent of derived.entities) {
+      if (!ent.name) continue;
+      const fields = ent.fields || [];
+      const hasStatusField = fields.some((f: any) => 
+        /status|state|stage|状态|阶段/i.test(f.name) || /status|state|stage|状态|阶段/i.test(f.description)
+      );
+
+      if (hasStatusField) {
+        const alreadyHasProcess = derived.processes.some((p: any) => p.name.includes(ent.name) || (p.scenarioName && p.scenarioName.includes(ent.name)));
+        if (!alreadyHasProcess) {
+          derived.processes.push({
+            scenarioName: `${ent.name}状态生命周期监管`,
+            name: `${ent.name}状态机核心转移流程设计 (State Machine)`,
+            steps: ['期初创建 (Draft/Created)', '风控审批中 (Verifying)', '激活/可履约 (Active/Authorized)', '终结归档 (Completed/Archived)', '拦截/挂起异常 (Suspended/Failed)'],
+            normalFlow: [
+              `1. 提交或创建业务实体，初始化状态默认为 Draft。`,
+              `2. 触发合规审批及多层资质拦截，通过后流转至 Active。`,
+              `3. 触发核心业务结算/归单节点，流转至 Completed 结束生命周期。`,
+            ],
+            alternateFlow: [
+              `异常挂起流: 任意资质核签不通过或规则碰撞，立刻流转至 Suspended 触发报警。`,
+            ],
+          });
+        }
+
+        const alreadyHasLog = derived.entities.some((e: any) => e.name.toLowerCase().includes(ent.name.toLowerCase() + 'changelog') || e.name.toLowerCase().includes(ent.name.toLowerCase() + 'log'));
+        if (!alreadyHasLog) {
+          derived.entities.push({
+            aggregateRootName: ent.aggregateRootName || ent.name,
+            name: `${ent.name}变更日志 (StatusChangeLog)`,
+            fields: [
+              { name: 'log_id', type: 'VARCHAR(64)', description: '变更日志唯一主键流水号', isIdentifier: true },
+              { name: 'entity_id', type: 'VARCHAR(64)', description: `关联的 ${ent.name} 唯一标识主键`, isIdentifier: false },
+              { name: 'old_state', type: 'VARCHAR(32)', description: '流转前旧状态值', isIdentifier: false },
+              { name: 'new_state', type: 'VARCHAR(32)', description: '流转后新状态值', isIdentifier: false },
+              { name: 'operator', type: 'VARCHAR(64)', description: '操作用户或服务节点名', isIdentifier: false },
+              { name: 'changed_at', type: 'TIMESTAMP', description: '变更触发物理时间戳', isIdentifier: false },
+            ],
+          });
+        }
+      }
+    }
+  }
+
+  // Rule 3: Pain point contains "traceability/verification" -> derive unique code generation & boundary interface interaction
+  if (textToScan.includes('溯源') || textToScan.includes('校验') || textToScan.includes('防伪') || textToScan.includes('合规') || textToScan.includes('拦截')) {
+    const hasTraceRule = derived.rules.some((r: any) => r.name.includes('唯一编码') || r.name.includes('溯源') || r.name.includes('合规'));
+    if (!hasTraceRule) {
+      const arName = derived.aggregates?.[0]?.name || '核心单据';
+      derived.rules.push({
+        aggregateRootName: arName,
+        name: `一物一码高安全防伪加密溯源校验规则 (Traceability Rule)`,
+        rule: `所有相关批次流通实体必须在前置源头节点强制在线赋码。引入 Snowflake 分布式安全哈希追加行业G1国家规范，产生高保密安全校验钥匙，流转全程秒级校验。`,
+        implementationHint: `扫码进出库强制与接口进行毫秒级认证，对不一致赋码或重复刷码进行熔断级自动挂载和封堵。`,
+      });
+    }
+
+    const hasInteraction = derived.interactions.some((i: any) => i.systemName.includes('监管') || i.systemName.includes('溯源') || i.systemName.includes('公共'));
+    if (!hasInteraction) {
+      derived.interactions.push({
+        systemName: '公共数据核验与商品安全溯源云监管中枢',
+        direction: 'downstream',
+        targetModuleName: derived.modules?.[0]?.name || '监管核算引擎',
+        coreWorkflow: '高频流通实体唯一码合法性验真及出入库备案契约',
+        interfaceLogic: '1. 调用 POST /api/v3/traceability/verify (传参：trace_code, biz_type, active_time)\n2. 校验通过则完成登记，不通过则秒级反馈异常并拦截当前交易流。'
+      });
+    }
+  }
+}
+
+// Smart merger and deduplication
+function mergeDerivedKnowledge(kb: KB_Store, derived: any, task?: any): any {
   const counts = { concepts: 0, entities: 0, aggregates: 0, scenarios: 0, processes: 0, rules: 0, modules: 0, elements: 0, interactions: 0 };
   if (!derived) return counts;
 
-  // UUID helper
   const uuid = (prefix: string) => `${prefix}_${Math.random().toString(36).substring(2, 9)}`;
 
   // 1. Aggregates
   if (Array.isArray(derived.aggregates)) {
     for (const ar of derived.aggregates) {
       if (!ar.name) continue;
-      const exists = kb.aggregates.find(a => a.name.toLowerCase() === ar.name.toLowerCase());
-      if (!exists) {
-        kb.aggregates.push({
+      
+      let bestMatch: any = null;
+      let maxSim = 0;
+      for (const existingAr of kb.aggregates) {
+        const sim = calculateSimilarity(ar.name, existingAr.name);
+        if (sim > maxSim) {
+          maxSim = sim;
+          bestMatch = existingAr;
+        }
+      }
+
+      if (maxSim > 0.85 && bestMatch) {
+        const originalInvariants = new Set(bestMatch.invariants || []);
+        if (Array.isArray(ar.invariants)) {
+          ar.invariants.forEach((inv: string) => originalInvariants.add(inv));
+        }
+        bestMatch.invariants = Array.from(originalInvariants);
+        
+        if (task) {
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `💡【智能去重】新推演聚合根 "${ar.name}" 与已有 "${bestMatch.name}" 相似度高达 ${(maxSim * 100).toFixed(1)}%，已自动安全合并核心不变性规则。`,
+            type: 'info',
+          });
+        }
+      } else {
+        const newAr: any = {
           id: uuid('ar'),
           domainId: kb.domain.id,
           name: ar.name,
@@ -2078,8 +2685,27 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
           repository: ar.repository || `${ar.name}Repository`,
           capExecution: true,
           capSupervision: false,
-          capStatistics: false
-        });
+          capStatistics: false,
+          seeAlso: []
+        };
+
+        if (maxSim >= 0.70 && maxSim <= 0.85 && bestMatch) {
+          newAr.seeAlso = newAr.seeAlso || [];
+          newAr.seeAlso.push(bestMatch.id);
+          if (!bestMatch.seeAlso) bestMatch.seeAlso = [];
+          bestMatch.seeAlso.push(newAr.id);
+          newAr.invariants.push(`同类对标架构参见: [${bestMatch.name}]`);
+          
+          if (task) {
+            task.logs.push({
+              timestamp: new Date().toISOString(),
+              message: `🔗【建立关联】新聚合根 "${ar.name}" 与已有 "${bestMatch.name}" 相似度为 ${(maxSim * 100).toFixed(1)}%，建立双向参见链接。`,
+              type: 'info',
+            });
+          }
+        }
+
+        kb.aggregates.push(newAr);
         counts.aggregates++;
       }
     }
@@ -2090,20 +2716,66 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
   if (Array.isArray(derived.concepts)) {
     for (const c of derived.concepts) {
       if (!c.name) continue;
-      const exists = kb.concepts.find(x => x.name.toLowerCase() === c.name.toLowerCase());
-      if (!exists) {
-        kb.concepts.push({
+
+      let bestMatch: any = null;
+      let maxSim = 0;
+      for (const existingC of kb.concepts) {
+        const sim = calculateSimilarity(c.name, existingC.name);
+        if (sim > maxSim) {
+          maxSim = sim;
+          bestMatch = existingC;
+        }
+      }
+
+      const conf = c.confidence || 0.8;
+
+      if (maxSim > 0.85 && bestMatch) {
+        const mergedAttrs = Array.from(new Set([...(bestMatch.attributes || []), ...(c.attributes || [])]));
+        bestMatch.attributes = mergedAttrs;
+        bestMatch.confidence = Math.max(bestMatch.confidence, conf);
+        if (c.definition && c.definition.length > (bestMatch.definition || '').length) {
+          bestMatch.definition = c.definition;
+        }
+        
+        if (task) {
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `💡【智能去重】新发现概念 "${c.name}" 与已有概念 "${bestMatch.name}" 相似度 ${(maxSim * 100).toFixed(1)}%，已智能合并属性和说明。`,
+            type: 'info',
+          });
+        }
+      } else {
+        const newC: any = {
           id: uuid('c'),
           domainId: kb.domain.id,
           name: c.name,
           definition: c.definition || '',
           attributes: c.attributes || [],
-          confidence: c.confidence || 0.8,
+          confidence: conf,
           sourceUrl: c.sourceUrl || '',
           treeType: c.treeType || (isIndustryOnly ? 'industry' : 'system'),
           conceptType: c.conceptType || (isIndustryOnly ? 'industry_general' : 'system_concept'),
-          subIndustry: c.subIndustry || ''
-        });
+          subIndustry: c.subIndustry || '',
+          seeAlso: []
+        };
+
+        if (maxSim >= 0.70 && maxSim <= 0.85 && bestMatch) {
+          newC.seeAlso = newC.seeAlso || [];
+          newC.seeAlso.push(bestMatch.id);
+          if (!bestMatch.seeAlso) bestMatch.seeAlso = [];
+          bestMatch.seeAlso.push(newC.id);
+          newC.definition += ` (关联概念参见: [${bestMatch.name}])`;
+
+          if (task) {
+            task.logs.push({
+              timestamp: new Date().toISOString(),
+              message: `🔗【建立关联】新概念 "${c.name}" 与已有 "${bestMatch.name}" 相似度为 ${(maxSim * 100).toFixed(1)}%，完成参见编织。`,
+              type: 'info',
+            });
+          }
+        }
+
+        kb.concepts.push(newC);
         counts.concepts++;
       }
     }
@@ -2113,106 +2785,192 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
   if (Array.isArray(derived.entities)) {
     for (const e of derived.entities) {
       if (!e.name) continue;
-      const exists = kb.entities.find(x => x.name.toLowerCase() === e.name.toLowerCase());
-      // Find aggregate id by name
+
+      let bestMatch: any = null;
+      let maxSim = 0;
+      for (const existingE of kb.entities) {
+        const sim = calculateSimilarity(e.name, existingE.name);
+        if (sim > maxSim) {
+          maxSim = sim;
+          bestMatch = existingE;
+        }
+      }
+
       let arId = '';
       if (e.aggregateRootName) {
-        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(e.aggregateRootName.toLowerCase()));
+        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(e.aggregateRootName.toLowerCase()) || e.aggregateRootName.toLowerCase().includes(a.name.toLowerCase()));
         if (ar) arId = ar.id;
       }
-      if (!exists) {
-        kb.entities.push({
+      if (!arId && kb.aggregates.length > 0) {
+        arId = kb.aggregates[0].id;
+      }
+
+      if (maxSim > 0.85 && bestMatch) {
+        const existingFieldNames = new Set(bestMatch.fields.map((f: any) => f.name.toLowerCase()));
+        if (Array.isArray(e.fields)) {
+          for (const f of e.fields) {
+            if (!existingFieldNames.has(f.name.toLowerCase())) {
+              bestMatch.fields.push(f);
+            }
+          }
+        }
+        if (arId && !bestMatch.aggregateRootId) {
+          bestMatch.aggregateRootId = arId;
+        }
+
+        if (task) {
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `💡【智能去重】新实体 "${e.name}" 与已有 "${bestMatch.name}" 相似度为 ${(maxSim * 100).toFixed(1)}%，已融合数据库字段。`,
+            type: 'info',
+          });
+        }
+      } else {
+        const newE: any = {
           id: uuid('e'),
           domainId: kb.domain.id,
           aggregateRootId: arId || undefined,
           name: e.name,
-          fields: e.fields || []
-        });
+          fields: e.fields || [],
+          seeAlso: []
+        };
+
+        if (maxSim >= 0.70 && maxSim <= 0.85 && bestMatch) {
+          newE.seeAlso = newE.seeAlso || [];
+          newE.seeAlso.push(bestMatch.id);
+          if (!bestMatch.seeAlso) bestMatch.seeAlso = [];
+          bestMatch.seeAlso.push(newE.id);
+          
+          if (task) {
+            task.logs.push({
+              timestamp: new Date().toISOString(),
+              message: `🔗【建立关联】新实体 "${e.name}" 与已有 "${bestMatch.name}" 相似度为 ${(maxSim * 100).toFixed(1)}%，智能完成参见。`,
+              type: 'info',
+            });
+          }
+        }
+
+        kb.entities.push(newE);
         counts.entities++;
-      } else if (arId && !exists.aggregateRootId) {
-        exists.aggregateRootId = arId;
       }
     }
   }
 
-  // 4. Level 2 Modules (二级领域核心模块)
+  // 4. Level 2 Modules
   if (!kb.modules) kb.modules = [];
   if (Array.isArray(derived.modules)) {
     for (const m of derived.modules) {
       if (!m.name) continue;
-      const exists = kb.modules.find(x => x.name.toLowerCase() === m.name.toLowerCase());
+
+      let bestMatch: any = null;
+      let maxSim = 0;
+      for (const existingM of kb.modules) {
+        const sim = calculateSimilarity(m.name, existingM.name);
+        if (sim > maxSim) {
+          maxSim = sim;
+          bestMatch = existingM;
+        }
+      }
+
       let arId = '';
       if (m.aggregateRootName) {
-        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(m.aggregateRootName.toLowerCase()));
+        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(m.aggregateRootName.toLowerCase()) || m.aggregateRootName.toLowerCase().includes(a.name.toLowerCase()));
         if (ar) arId = ar.id;
       }
       if (!arId && kb.aggregates.length > 0) arId = kb.aggregates[0].id;
 
-      if (arId && !exists) {
-        kb.modules.push({
-          id: uuid('m'),
-          domainId: kb.domain.id,
-          aggregateRootId: arId,
-          name: m.name,
-          capabilityType: m.capabilityType || 'other',
-          description: m.description || ''
-        });
-        counts.modules++;
+      if (maxSim > 0.85 && bestMatch) {
+        if (m.description && m.description.length > (bestMatch.description || '').length) {
+          bestMatch.description = m.description;
+        }
+      } else {
+        if (arId) {
+          kb.modules.push({
+            id: uuid('m'),
+            domainId: kb.domain.id,
+            aggregateRootId: arId,
+            name: m.name,
+            capabilityType: m.capabilityType || 'other',
+            description: m.description || ''
+          });
+          counts.modules++;
+        }
       }
     }
   }
 
-  // 5. Level 3 Elements (三级阶梯特征细节子要素)
+  // 5. Level 3 Elements
   if (!kb.elements) kb.elements = [];
   if (Array.isArray(derived.elements)) {
     for (const el of derived.elements) {
       if (!el.name) continue;
-      const exists = kb.elements.find(x => x.name.toLowerCase() === el.name.toLowerCase());
+
+      let bestMatch: any = null;
+      let maxSim = 0;
+      for (const existingEl of kb.elements) {
+        const sim = calculateSimilarity(el.name, existingEl.name);
+        if (sim > maxSim) {
+          maxSim = sim;
+          bestMatch = existingEl;
+        }
+      }
+
       let moduleId = '';
       if (el.moduleName) {
-        const mod = kb.modules.find(m => m.name.toLowerCase().includes(el.moduleName.toLowerCase()));
+        const mod = kb.modules.find(m => m.name.toLowerCase().includes(el.moduleName.toLowerCase()) || el.moduleName.toLowerCase().includes(m.name.toLowerCase()));
         if (mod) moduleId = mod.id;
       }
       if (!moduleId && kb.modules.length > 0) moduleId = kb.modules[0].id;
 
-      if (moduleId && !exists) {
-        kb.elements.push({
-          id: uuid('el'),
-          domainId: kb.domain.id,
-          moduleId,
-          name: el.name,
-          type: el.type || 'sub_process',
-          detail: el.detail || ''
-        });
-        counts.elements++;
+      if (maxSim > 0.85 && bestMatch) {
+        if (el.detail && el.detail.length > (bestMatch.detail || '').length) {
+          bestMatch.detail = el.detail;
+        }
+      } else {
+        if (moduleId) {
+          kb.elements.push({
+            id: uuid('el'),
+            domainId: kb.domain.id,
+            moduleId,
+            name: el.name,
+            type: el.type || 'sub_process',
+            detail: el.detail || ''
+          });
+          counts.elements++;
+        }
       }
     }
   }
 
-  // 6. Upstream & Downstream system interactions (接口系统双向交互契约)
+  // 6. Upstream & Downstream interactions
   if (!kb.interactions) kb.interactions = [];
   if (Array.isArray(derived.interactions)) {
     for (const inter of derived.interactions) {
       if (!inter.systemName) continue;
       let targetModuleId = '';
       if (inter.targetModuleName) {
-        const mod = kb.modules.find(m => m.name.toLowerCase().includes(inter.targetModuleName.toLowerCase()));
+        const mod = kb.modules.find(m => m.name.toLowerCase().includes(inter.targetModuleName.toLowerCase()) || inter.targetModuleName.toLowerCase().includes(m.name.toLowerCase()));
         if (mod) targetModuleId = mod.id;
       }
       if (!targetModuleId && kb.modules.length > 0) targetModuleId = kb.modules[0].id;
 
-      const exists = kb.interactions.find(x => x.systemName.toLowerCase() === inter.systemName.toLowerCase() && x.targetModuleId === targetModuleId);
-      if (targetModuleId && !exists) {
-        kb.interactions.push({
-          id: uuid('i'),
-          domainId: kb.domain.id,
-          systemName: inter.systemName,
-          direction: inter.direction === 'upstream' ? 'upstream' : 'downstream',
-          targetModuleId,
-          coreWorkflow: inter.coreWorkflow || '',
-          interfaceLogic: inter.interfaceLogic || ''
-        });
-        counts.interactions++;
+      if (targetModuleId) {
+        const exists = kb.interactions.find(x => 
+          calculateSimilarity(x.systemName, inter.systemName) > 0.85 && 
+          x.targetModuleId === targetModuleId
+        );
+        if (!exists) {
+          kb.interactions.push({
+            id: uuid('i'),
+            domainId: kb.domain.id,
+            systemName: inter.systemName,
+            direction: inter.direction === 'upstream' ? 'upstream' : 'downstream',
+            targetModuleId,
+            coreWorkflow: inter.coreWorkflow || '',
+            interfaceLogic: inter.interfaceLogic || ''
+          });
+          counts.interactions++;
+        }
       }
     }
   }
@@ -2223,16 +2981,18 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
       if (!s.name) continue;
       let arId = '';
       if (s.aggregateRootName) {
-        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(s.aggregateRootName.toLowerCase()));
+        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(s.aggregateRootName.toLowerCase()) || s.aggregateRootName.toLowerCase().includes(a.name.toLowerCase()));
         if (ar) arId = ar.id;
       }
-      // If no Aggregate Root bound, use the first one if present, otherwise ignore or make generic
       if (!arId && kb.aggregates.length > 0) {
         arId = kb.aggregates[0].id;
       }
 
       if (arId) {
-        const exists = kb.scenarios.find(x => x.name.toLowerCase() === s.name.toLowerCase() && x.aggregateRootId === arId);
+        const exists = kb.scenarios.find(x => 
+          calculateSimilarity(x.name, s.name) > 0.85 && 
+          x.aggregateRootId === arId
+        );
         if (!exists) {
           kb.scenarios.push({
             id: uuid('s'),
@@ -2256,7 +3016,7 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
       if (!p.name) continue;
       let scenarioId = '';
       if (p.scenarioName) {
-        const s = kb.scenarios.find(x => x.name.toLowerCase().includes(p.scenarioName.toLowerCase()));
+        const s = kb.scenarios.find(x => x.name.toLowerCase().includes(p.scenarioName.toLowerCase()) || p.scenarioName.toLowerCase().includes(x.name.toLowerCase()));
         if (s) scenarioId = s.id;
       }
       if (!scenarioId && kb.scenarios.length > 0) {
@@ -2264,7 +3024,7 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
       }
 
       if (scenarioId) {
-        const exists = kb.processes.find(x => x.name.toLowerCase() === p.name.toLowerCase());
+        const exists = kb.processes.find(x => calculateSimilarity(x.name, p.name) > 0.85);
         if (!exists) {
           kb.processes.push({
             id: uuid('p'),
@@ -2286,7 +3046,7 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
       if (!r.name) continue;
       let arId = '';
       if (r.aggregateRootName) {
-        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(r.aggregateRootName.toLowerCase()));
+        const ar = kb.aggregates.find(a => a.name.toLowerCase().includes(r.aggregateRootName.toLowerCase()) || r.aggregateRootName.toLowerCase().includes(a.name.toLowerCase()));
         if (ar) arId = ar.id;
       }
       if (!arId && kb.aggregates.length > 0) {
@@ -2294,7 +3054,10 @@ function mergeDerivedKnowledge(kb: KB_Store, derived: any): any {
       }
 
       if (arId) {
-        const exists = kb.rules.find(x => x.name.toLowerCase() === r.name.toLowerCase() && x.aggregateRootId === arId);
+        const exists = kb.rules.find(x => 
+          calculateSimilarity(x.name, r.name) > 0.85 && 
+          x.aggregateRootId === arId
+        );
         if (!exists) {
           kb.rules.push({
             id: uuid('rl'),
@@ -2349,10 +3112,7 @@ ${JSON.stringify(kb.entities.map(e => ({ id: e.id, name: e.name, fields: e.field
     const config = db.getDomainConfig(kb.domain.id);
     const model = config?.preferredModel || 'deepseek';
     const res = await generateFlexibleLLM(detectPrompt, true, task, ai, model);
-
-    let raw = res.text || '[]';
-    raw = stripMarkdownCodeBlock(raw);
-    const instructions = JSON.parse(raw);
+    const instructions = safeParseJSON<any[]>(res.text || '[]', []);
 
     if (Array.isArray(instructions) && instructions.length > 0) {
       let msg = '';
@@ -2658,16 +3418,65 @@ function generateMarkdown(kb: KB_Store): string {
   return md;
 }
 
-// Strip markdown block helper
+// Strip markdown block helper with highly resilient fallback matching for JSON blocks
 function stripMarkdownCodeBlock(text: string): string {
+  if (!text) return '';
   let cleaned = text.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```[a-zA-Z0-9]*\r?\n/, '');
-    if (cleaned.endsWith('```')) {
-      cleaned = cleaned.substring(0, cleaned.length - 3);
+
+  // 1. Try to extract content inside ```json ... ``` or ``` ... ```
+  const blockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (blockMatch) {
+    cleaned = blockMatch[1].trim();
+  } else {
+    // 2. If no markdown blocks, find the first '[' or '{' and the last ']' or '}' to strip conversational padding
+    const firstBracket = cleaned.indexOf('[');
+    const firstBrace = cleaned.indexOf('{');
+    let startIdx = -1;
+    let endIdx = -1;
+
+    if (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
+      startIdx = firstBracket;
+      endIdx = cleaned.lastIndexOf(']');
+    } else if (firstBrace !== -1) {
+      startIdx = firstBrace;
+      endIdx = cleaned.lastIndexOf('}');
+    }
+
+    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+      cleaned = cleaned.substring(startIdx, endIdx + 1).trim();
     }
   }
+
   return cleaned.trim();
+}
+
+// Global safe JSON parsing helper that cleans input and repairs standard LLM format errors
+function safeParseJSON<T>(text: string, defaultValue: T): T {
+  const cleaned = stripMarkdownCodeBlock(text || '');
+  if (!cleaned) return defaultValue;
+
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch (err: any) {
+    console.error('⚠️ [JSON 解析初次失败]', err.message, '\n原始输入长度:', text.length);
+    try {
+      // Secondary repair: strip trailing commas inside array/objects and common LLM malformations
+      let repaired = cleaned
+        // Remove trailing commas inside arrays or objects e.g. [1, 2,] -> [1, 2] or {a: 1,} -> {a: 1}
+        .replace(/,\s*([\]}])/g, '$1')
+        // Fix double commas e.g. ,,
+        .replace(/,\s*,/g, ',')
+        // Wrap unquoted property names
+        .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
+        // Normalize single-quoted values to double-quoted values
+        .replace(/:\s*'([^']*)'/g, ':"$1"');
+
+      return JSON.parse(repaired) as T;
+    } catch (repairErr: any) {
+      console.error('🛑 [JSON 解析二次修复亦失败] 无法自主恢复，使用默认降级数据。错误:', repairErr.message);
+      return defaultValue;
+    }
+  }
 }
 
 // Start full-stack web and API integrations

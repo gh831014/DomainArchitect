@@ -102,6 +102,15 @@ export interface KB_Store {
   modules?: LevelTwoModule[];
   elements?: LevelThreeElement[];
   interactions?: SystemInteraction[];
+  isolatedNodeSearchAttempts?: Record<string, number>;
+  checkpoints?: {
+    phase1_1?: boolean;
+    phase1_2?: boolean;
+    phase1_3?: boolean;
+    phase1_4?: boolean;
+    phase2_round?: number;
+    phase2_rounds?: Record<number, boolean>;
+  };
 }
 
 export interface LevelTwoModule {

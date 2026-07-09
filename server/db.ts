@@ -153,6 +153,373 @@ function initializeDatabase() {
   })();
 }
 
+// Call initialization immediately on module load
+initializeDatabase();
+
+// Auto-cleanup stale running tasks on startup AFTER migration/seeding is complete
+try {
+  const rows = sqlite.prepare('SELECT taskId, payload FROM tasks').all() as any[];
+  for (const row of rows) {
+    try {
+      const task = JSON.parse(row.payload) as IterationProgress;
+      if (task && task.status === 'running') {
+        task.status = 'failed';
+        task.message = '系统重启，未完成的构建任务已自动终止。请重新点击构建。';
+        task.logs.push({
+          timestamp: new Date().toISOString(),
+          message: '🛑 检测到服务器非正常终止或重启，未完成的模型演练任务已自动停止。请在主界面重新触发构建。',
+          type: 'error'
+        });
+        sqlite.prepare('UPDATE tasks SET payload = ? WHERE taskId = ?').run(JSON.stringify(task), task.taskId);
+      }
+    } catch (parseErr) {
+      console.error('Failed to parse task during stale task cleanup on startup:', parseErr);
+    }
+  }
+} catch (cleanErr) {
+  console.error('Failed to cleanup stale tasks on startup:', cleanErr);
+}
+
+// Deduplicate and merge knowledge points
+export function deduplicateKB(store: KB_Store): KB_Store {
+  const idMap = new Map<string, string>();
+
+  // Helpers for normalization
+  const getCleanChineseName = (name: string): string => {
+    const chMatch = name.match(/[\u4e00-\u9fa5]+/);
+    return chMatch ? chMatch[0] : name.trim().toLowerCase();
+  };
+
+  const isDuplicateName = (name1: string, name2: string): boolean => {
+    const n1 = (name1 || '').trim().toLowerCase();
+    const n2 = (name2 || '').trim().toLowerCase();
+    if (n1 === n2) return true;
+
+    const c1 = getCleanChineseName(n1);
+    const c2 = getCleanChineseName(n2);
+    if (c1 && c2 && c1 === c2) return true;
+
+    const k1 = n1.replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
+    const k2 = n2.replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
+    if (k1 && k2) {
+      if (k1 === k2) return true;
+      if (k1.includes(k2) || k2.includes(k1)) {
+        const diff = Math.abs(k1.length - k2.length);
+        if (diff <= 2) return true;
+      }
+    }
+
+    return false;
+  };
+
+  // 1. Deduplicate Aggregates
+  const uniqueAggregates: typeof store.aggregates = [];
+  for (const ar of (store.aggregates || [])) {
+    const existing = uniqueAggregates.find(x => isDuplicateName(x.name, ar.name));
+    if (existing) {
+      idMap.set(ar.id, existing.id);
+      // Merge invariants
+      const allInvs = [...(existing.invariants || []), ...(ar.invariants || [])];
+      const normInvs = new Set<string>();
+      existing.invariants = [];
+      for (const inv of allInvs) {
+        if (!inv) continue;
+        const norm = inv.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
+        if (!normInvs.has(norm)) {
+          normInvs.add(norm);
+          existing.invariants.push(inv);
+        }
+      }
+      // Merge cap flags
+      existing.capExecution = existing.capExecution || ar.capExecution;
+      existing.capSupervision = existing.capSupervision || ar.capSupervision;
+      existing.capStatistics = existing.capStatistics || ar.capStatistics;
+    } else {
+      uniqueAggregates.push(ar);
+    }
+  }
+
+  // 2. Deduplicate Concepts (Glossary)
+  const uniqueConcepts: typeof store.concepts = [];
+  for (const c of (store.concepts || [])) {
+    const existing = uniqueConcepts.find(x => isDuplicateName(x.name, c.name));
+    if (existing) {
+      idMap.set(c.id, existing.id);
+      // Merge definitions (keep longer)
+      if (c.definition && (!existing.definition || c.definition.length > existing.definition.length)) {
+        existing.definition = c.definition;
+      }
+      // Merge attributes
+      const allAttrs = [...(existing.attributes || []), ...(c.attributes || [])];
+      existing.attributes = Array.from(new Set(allAttrs.map(a => (a || '').trim()))).filter(Boolean);
+      // Confidence
+      existing.confidence = Math.max(existing.confidence || 0, c.confidence || 0);
+      // Source URL
+      if (!existing.sourceUrl && c.sourceUrl) {
+        existing.sourceUrl = c.sourceUrl;
+      }
+      // Sources
+      const existingSources = existing.sources || [];
+      const newSources = c.sources || [];
+      const combinedSources = [...existingSources, ...newSources];
+      const seenSourceKeys = new Set<string>();
+      existing.sources = [];
+      for (const s of combinedSources) {
+        if (!s) continue;
+        const key = (s.url || s.title || '').trim().toLowerCase();
+        if (key && !seenSourceKeys.has(key)) {
+          seenSourceKeys.add(key);
+          existing.sources.push(s);
+        }
+      }
+      // Keep most specific type
+      if (c.conceptType && c.conceptType !== 'industry_general') {
+        existing.conceptType = c.conceptType;
+      }
+      if (c.treeType === 'system') {
+        existing.treeType = 'system';
+      }
+    } else {
+      uniqueConcepts.push(c);
+    }
+  }
+
+  // 3. Deduplicate Entities
+  const uniqueEntities: typeof store.entities = [];
+  for (const ent of (store.entities || [])) {
+    const arId = ent.aggregateRootId ? (idMap.get(ent.aggregateRootId) || ent.aggregateRootId) : undefined;
+    const existing = uniqueEntities.find(x => 
+      isDuplicateName(x.name, ent.name) && 
+      (x.aggregateRootId === arId || !x.aggregateRootId || !arId)
+    );
+    if (existing) {
+      idMap.set(ent.id, existing.id);
+      // Merge fields
+      const mergedFieldsMap = new Map<string, any>();
+      for (const f of [...(existing.fields || []), ...(ent.fields || [])]) {
+        if (!f || !f.name) continue;
+        const fKey = f.name.trim().toLowerCase();
+        if (!mergedFieldsMap.has(fKey)) {
+          mergedFieldsMap.set(fKey, f);
+        } else {
+          const ext = mergedFieldsMap.get(fKey);
+          if (f.description && (!ext.description || f.description.length > ext.description.length)) {
+            ext.description = f.description;
+          }
+          if (f.isIdentifier) {
+            ext.isIdentifier = true;
+          }
+        }
+      }
+      existing.fields = Array.from(mergedFieldsMap.values());
+    } else {
+      uniqueEntities.push({
+        ...ent,
+        aggregateRootId: arId
+      });
+    }
+  }
+
+  // 4. Deduplicate Modules (L2)
+  const uniqueModules: NonNullable<typeof store.modules> = [];
+  for (const m of (store.modules || [])) {
+    const arId = m.aggregateRootId ? (idMap.get(m.aggregateRootId) || m.aggregateRootId) : undefined;
+    const existing = uniqueModules.find(x => isDuplicateName(x.name, m.name));
+    if (existing) {
+      idMap.set(m.id, existing.id);
+      if (m.description && (!existing.description || m.description.length > existing.description.length)) {
+        existing.description = m.description;
+      }
+      if (m.capabilityType && m.capabilityType !== 'other') {
+        existing.capabilityType = m.capabilityType;
+      }
+    } else {
+      uniqueModules.push({
+        ...m,
+        aggregateRootId: arId || ''
+      });
+    }
+  }
+
+  // 5. Deduplicate Scenarios
+  const uniqueScenarios: typeof store.scenarios = [];
+  for (const sc of (store.scenarios || [])) {
+    const arId = sc.aggregateRootId ? (idMap.get(sc.aggregateRootId) || sc.aggregateRootId) : undefined;
+    const existing = uniqueScenarios.find(x => isDuplicateName(x.name, sc.name) && x.aggregateRootId === arId);
+    if (existing) {
+      idMap.set(sc.id, existing.id);
+      existing.actors = Array.from(new Set([...(existing.actors || []), ...(sc.actors || [])].map(a => (a || '').trim()))).filter(Boolean);
+      existing.preconditions = Array.from(new Set([...(existing.preconditions || []), ...(sc.preconditions || [])].map(p => (p || '').trim()))).filter(Boolean);
+      if (sc.steps && sc.steps.length > (existing.steps ? existing.steps.length : 0)) {
+        existing.steps = sc.steps;
+      }
+      existing.exceptionHandling = Array.from(new Set([...(existing.exceptionHandling || []), ...(sc.exceptionHandling || [])].map(e => (e || '').trim()))).filter(Boolean);
+    } else {
+      uniqueScenarios.push({
+        ...sc,
+        aggregateRootId: arId || ''
+      });
+    }
+  }
+
+  // 6. Deduplicate Processes
+  const uniqueProcesses: typeof store.processes = [];
+  for (const pr of (store.processes || [])) {
+    const scId = pr.scenarioId ? (idMap.get(pr.scenarioId) || pr.scenarioId) : undefined;
+    const existing = uniqueProcesses.find(x => isDuplicateName(x.name, pr.name));
+    if (existing) {
+      idMap.set(pr.id, existing.id);
+      if (pr.steps && pr.steps.length > (existing.steps ? existing.steps.length : 0)) {
+        existing.steps = pr.steps;
+      }
+      existing.normalFlow = Array.from(new Set([...(existing.normalFlow || []), ...(pr.normalFlow || [])].map(f => (f || '').trim()))).filter(Boolean);
+      existing.alternateFlow = Array.from(new Set([...(existing.alternateFlow || []), ...(pr.alternateFlow || [])].map(f => (f || '').trim()))).filter(Boolean);
+    } else {
+      uniqueProcesses.push({
+        ...pr,
+        scenarioId: scId || ''
+      });
+    }
+  }
+
+  // 7. Deduplicate Rules (CoreLogic)
+  const uniqueRules: typeof store.rules = [];
+  for (const r of (store.rules || [])) {
+    const arId = r.aggregateRootId ? (idMap.get(r.aggregateRootId) || r.aggregateRootId) : undefined;
+    const existing = uniqueRules.find(x => isDuplicateName(x.name, r.name) && x.aggregateRootId === arId);
+    if (existing) {
+      idMap.set(r.id, existing.id);
+      if (r.rule && (!existing.rule || r.rule.length > existing.rule.length)) {
+        existing.rule = r.rule;
+      }
+      if (r.implementationHint && (!existing.implementationHint || r.implementationHint.length > existing.implementationHint.length)) {
+        existing.implementationHint = r.implementationHint;
+      }
+    } else {
+      uniqueRules.push({
+        ...r,
+        aggregateRootId: arId || ''
+      });
+    }
+  }
+
+  // 8. Deduplicate Hypotheses
+  const uniqueHypotheses: typeof store.hypotheses = [];
+  for (const h of (store.hypotheses || [])) {
+    const existing = uniqueHypotheses.find(x => {
+      const s1 = (x.statement || '').trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
+      const s2 = (h.statement || '').trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
+      return s1 === s2;
+    });
+    if (existing) {
+      idMap.set(h.id, existing.id);
+      existing.confidence = Math.max(existing.confidence || 0, h.confidence || 0);
+      if (h.status === 'verified') {
+        existing.status = 'verified';
+      }
+      if (h.reason && (!existing.reason || h.reason.length > existing.reason.length)) {
+        existing.reason = h.reason;
+      }
+      const existingSources = existing.sources || [];
+      const newSources = h.sources || [];
+      const combinedSources = [...existingSources, ...newSources];
+      const seenSourceKeys = new Set<string>();
+      existing.sources = [];
+      for (const s of combinedSources) {
+        if (!s) continue;
+        const key = (s.url || s.title || '').trim().toLowerCase();
+        if (key && !seenSourceKeys.has(key)) {
+          seenSourceKeys.add(key);
+          existing.sources.push(s);
+        }
+      }
+    } else {
+      uniqueHypotheses.push(h);
+    }
+  }
+
+  // 9. Deduplicate Elements (L3)
+  const uniqueElements: NonNullable<typeof store.elements> = [];
+  for (const el of (store.elements || [])) {
+    const modId = el.moduleId ? (idMap.get(el.moduleId) || el.moduleId) : undefined;
+    const existing = uniqueElements.find(x => isDuplicateName(x.name, el.name) && x.moduleId === modId);
+    if (existing) {
+      idMap.set(el.id, existing.id);
+      if (el.detail && (!existing.detail || el.detail.length > existing.detail.length)) {
+        existing.detail = el.detail;
+      }
+    } else {
+      uniqueElements.push({
+        ...el,
+        moduleId: modId || ''
+      });
+    }
+  }
+
+  // 10. Deduplicate Interactions
+  const uniqueInteractions: NonNullable<typeof store.interactions> = [];
+  for (const inter of (store.interactions || [])) {
+    const modId = inter.targetModuleId ? (idMap.get(inter.targetModuleId) || inter.targetModuleId) : undefined;
+    const existing = uniqueInteractions.find(x => 
+      x.systemName.trim().toLowerCase() === inter.systemName.trim().toLowerCase() &&
+      x.direction === inter.direction &&
+      x.targetModuleId === modId
+    );
+    if (existing) {
+      idMap.set(inter.id, existing.id);
+      if (inter.coreWorkflow && (!existing.coreWorkflow || inter.coreWorkflow.length > existing.coreWorkflow.length)) {
+        existing.coreWorkflow = inter.coreWorkflow;
+      }
+      if (inter.interfaceLogic && (!existing.interfaceLogic || inter.interfaceLogic.length > existing.interfaceLogic.length)) {
+        existing.interfaceLogic = inter.interfaceLogic;
+      }
+    } else {
+      uniqueInteractions.push({
+        ...inter,
+        targetModuleId: modId || ''
+      });
+    }
+  }
+
+  // Pass to update seeAlso list and any self references
+  const updateSeeAlso = (arr: any[]) => {
+    if (!arr) return;
+    for (const item of arr) {
+      if (item.seeAlso) {
+        const updated = (item.seeAlso as string[]).map(id => idMap.get(id) || id);
+        item.seeAlso = Array.from(new Set(updated)).filter(id => id !== item.id);
+      }
+    }
+  };
+
+  const cleanStore: KB_Store = {
+    ...store,
+    concepts: uniqueConcepts,
+    entities: uniqueEntities,
+    aggregates: uniqueAggregates,
+    scenarios: uniqueScenarios,
+    processes: uniqueProcesses,
+    rules: uniqueRules,
+    hypotheses: uniqueHypotheses,
+    modules: uniqueModules,
+    elements: uniqueElements,
+    interactions: uniqueInteractions
+  };
+
+  updateSeeAlso(cleanStore.concepts);
+  updateSeeAlso(cleanStore.entities);
+  updateSeeAlso(cleanStore.aggregates);
+  updateSeeAlso(cleanStore.modules);
+  updateSeeAlso(cleanStore.scenarios);
+  updateSeeAlso(cleanStore.processes);
+  updateSeeAlso(cleanStore.rules);
+  updateSeeAlso(cleanStore.hypotheses);
+  updateSeeAlso(cleanStore.elements);
+  updateSeeAlso(cleanStore.interactions);
+
+  return cleanStore;
+}
+
 // Expose helper API methods
 export const db = {
   getDomains(): Domain[] {
@@ -209,8 +576,63 @@ export const db = {
     }
   },
 
-  saveDomainKB(domainId: string, store: KB_Store): void {
+  saveDomainKB(domainId: string, rawStore: KB_Store, task?: IterationProgress): void {
     initializeDatabase();
+    
+    const beforeCount = {
+      concepts: rawStore.concepts?.length || 0,
+      entities: rawStore.entities?.length || 0,
+      aggregates: rawStore.aggregates?.length || 0,
+      scenarios: rawStore.scenarios?.length || 0,
+      processes: rawStore.processes?.length || 0,
+      rules: rawStore.rules?.length || 0,
+      hypotheses: rawStore.hypotheses?.length || 0,
+    };
+
+    const store = deduplicateKB(rawStore);
+
+    const afterCount = {
+      concepts: store.concepts?.length || 0,
+      entities: store.entities?.length || 0,
+      aggregates: store.aggregates?.length || 0,
+      scenarios: store.scenarios?.length || 0,
+      processes: store.processes?.length || 0,
+      rules: store.rules?.length || 0,
+      hypotheses: store.hypotheses?.length || 0,
+    };
+
+    const diffCount = 
+      (beforeCount.concepts - afterCount.concepts) +
+      (beforeCount.entities - afterCount.entities) +
+      (beforeCount.aggregates - afterCount.aggregates) +
+      (beforeCount.scenarios - afterCount.scenarios) +
+      (beforeCount.processes - afterCount.processes) +
+      (beforeCount.rules - afterCount.rules) +
+      (beforeCount.hypotheses - afterCount.hypotheses);
+
+    if (task && diffCount > 0) {
+      const details: string[] = [];
+      if (beforeCount.concepts > afterCount.concepts) details.push(`词汇术语 x${beforeCount.concepts - afterCount.concepts}`);
+      if (beforeCount.entities > afterCount.entities) details.push(`实体模型 x${beforeCount.entities - afterCount.entities}`);
+      if (beforeCount.aggregates > afterCount.aggregates) details.push(`聚合根 x${beforeCount.aggregates - afterCount.aggregates}`);
+      if (beforeCount.rules > afterCount.rules) details.push(`核心规则 x${beforeCount.rules - afterCount.rules}`);
+      if (beforeCount.scenarios > afterCount.scenarios) details.push(`场景流 x${beforeCount.scenarios - afterCount.scenarios}`);
+      if (beforeCount.processes > afterCount.processes) details.push(`步骤流 x${beforeCount.processes - afterCount.processes}`);
+      if (beforeCount.hypotheses > afterCount.hypotheses) details.push(`探针假设 x${beforeCount.hypotheses - afterCount.hypotheses}`);
+
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `🔄【消重引擎触发】检测到并消除 ${diffCount} 个重复知识要素 (${details.join(', ')})，关系已自动重定向并对齐。`,
+        type: 'info'
+      });
+      
+      try {
+        sqlite.prepare('UPDATE tasks SET payload = ? WHERE taskId = ?').run(JSON.stringify(task), task.taskId);
+      } catch (taskErr) {
+        console.error('Failed to update task log during deduplication:', taskErr);
+      }
+    }
+
     try {
       sqlite.transaction(() => {
         // Save domain basic info too, in case elements of it changed

@@ -141,6 +141,36 @@ export default function App() {
   // Auto-scroller for log window
   const logsEndRef = useRef<HTMLDivElement>(null);
 
+  // Safe Fetch Helper with robust auto-retry to withstand network glitches or dev-server restarts
+  const safeFetchJson = async (url: string, options?: RequestInit, retries = 3, delay = 250) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        const res = await fetch(url, options);
+        if (!res.ok) {
+          let msg = `Server returned status ${res.status}`;
+          try {
+            const body = await res.json();
+            if (body && body.error) msg = body.error;
+          } catch {}
+          throw new Error(msg);
+        }
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          throw new Error('Server returned non-JSON response');
+        }
+        return await res.json();
+      } catch (err: any) {
+        const isLast = i === retries - 1;
+        if (isLast) {
+          console.warn(`[API] safeFetchJson exhausted all ${retries} attempts for ${url}:`, err.message || err);
+          throw err;
+        }
+        // Wait before next attempt with exponential backoff
+        await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+      }
+    }
+  };
+
   // Load all domains initially
   useEffect(() => {
     fetchDomains();
@@ -149,14 +179,13 @@ export default function App() {
   // Fetch the active domains
   const fetchDomains = async () => {
     try {
-      const res = await fetch('/api/domains');
-      const data = await res.json();
+      const data = await safeFetchJson('/api/domains');
       setDomains(data);
       if (data.length > 0 && !selectedDomainId) {
         setSelectedDomainId(data[0].id);
       }
-    } catch (e) {
-      console.error('Error loading domains:', e);
+    } catch (e: any) {
+      console.warn('Error loading domains:', e?.message || e);
     }
   };
 
@@ -172,23 +201,20 @@ export default function App() {
   // Fetch KB & config details
   const fetchDomainDetails = async (id: string) => {
     try {
-      const kbRes = await fetch(`/api/domains/${id}/kb`);
-      const kbData = await kbRes.json();
+      const kbData = await safeFetchJson(`/api/domains/${id}/kb`);
       setKb(kbData);
 
-      const cfgRes = await fetch(`/api/domains/${id}/config`);
-      const cfgData = await cfgRes.json();
+      const cfgData = await safeFetchJson(`/api/domains/${id}/config`);
       setConfig(cfgData);
-    } catch (e) {
-      console.error('Error fetching domain details:', e);
+    } catch (e: any) {
+      console.warn('Error fetching domain details:', e?.message || e);
     }
   };
 
   // Detect and synchronize active workflows running for this domain
   const checkActiveTasks = async () => {
     try {
-      const res = await fetch('/api/tasks');
-      const data: IterationProgress[] = await res.json();
+      const data: IterationProgress[] = await safeFetchJson('/api/tasks');
       const currentDomainName = domains.find(d => d.id === selectedDomainId)?.name;
       
       const runningTask = data.find(t => t.domainName === currentDomainName && t.status === 'running');
@@ -197,8 +223,8 @@ export default function App() {
         setTaskProgress(runningTask);
         setIsPolling(true);
       }
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      console.warn('Error checking active tasks:', e?.message || e);
     }
   };
 
@@ -208,35 +234,30 @@ export default function App() {
     if (isPolling && activeTaskId) {
       timer = setInterval(async () => {
         try {
-          const res = await fetch(`/api/tasks/${activeTaskId}`);
-          if (res.ok) {
-            const data: IterationProgress = await res.json();
-            setTaskProgress(data);
-            
-            // Re-fetch KB data continuously during active run to show live incremental knowledge updates
-            if (selectedDomainId) {
-              const kbRes = await fetch(`/api/domains/${selectedDomainId}/kb`);
-              if (kbRes.ok) {
-                const kbData = await kbRes.json();
-                setKb(kbData);
-              }
+          const data: IterationProgress = await safeFetchJson(`/api/tasks/${activeTaskId}`);
+          setTaskProgress(data);
+          
+          // Re-fetch KB data continuously during active run to show live incremental knowledge updates
+          if (selectedDomainId) {
+            try {
+              const kbData = await safeFetchJson(`/api/domains/${selectedDomainId}/kb`);
+              setKb(kbData);
+            } catch (kbErr) {
+              console.warn('Live KB sync skipped due to network glitch:', kbErr);
             }
+          }
 
-            if (data.status === 'completed' || data.status === 'failed' || data.status === 'paused') {
-              setIsPolling(false);
-              setActiveTaskId(null);
-              // final refresh
-              if (selectedDomainId) {
-                fetchDomainDetails(selectedDomainId);
-              }
-            }
-          } else {
+          if (data.status === 'completed' || data.status === 'failed' || data.status === 'paused') {
             setIsPolling(false);
             setActiveTaskId(null);
+            // final refresh
+            if (selectedDomainId) {
+              fetchDomainDetails(selectedDomainId);
+            }
           }
-        } catch (e) {
-          console.error(e);
-          setIsPolling(false);
+        } catch (e: any) {
+          console.warn('Polling error (likely transient):', e?.message || e);
+          // Don't stop polling on a temporary single network blip, just log it, unless it persists
         }
       }, 2000);
     }
@@ -262,7 +283,7 @@ export default function App() {
     e.preventDefault();
     if (!domainNameInput || !domainSysNameInput) return;
     try {
-      const res = await fetch('/api/domains', {
+      const newDomain = await safeFetchJson('/api/domains', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -271,17 +292,14 @@ export default function App() {
           description: domainDescInput
         })
       });
-      if (res.ok) {
-        const newDomain = await res.json();
-        setDomains(prev => [...prev, newDomain]);
-        setSelectedDomainId(newDomain.id);
-        setShowCreateDomainModal(false);
-        setDomainNameInput('');
-        setDomainSysNameInput('');
-        setDomainDescInput('');
-      }
-    } catch (err) {
-      console.error(err);
+      setDomains(prev => [...prev, newDomain]);
+      setSelectedDomainId(newDomain.id);
+      setShowCreateDomainModal(false);
+      setDomainNameInput('');
+      setDomainSysNameInput('');
+      setDomainDescInput('');
+    } catch (err: any) {
+      console.error('Failed to create domain:', err);
     }
   };
 
@@ -319,20 +337,17 @@ export default function App() {
     setIsAnalyzingStructure(true);
     setAnalysisResult(null);
     try {
-      const res = await fetch('/api/domains/analyze-structure', {
+      const data = await safeFetchJson('/api/domains/analyze-structure', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: domainNameInput })
       });
-      if (res.ok) {
-        const data = await res.json();
-        setAnalysisResult(data);
-        if (data.systemName) {
-          setDomainSysNameInput(data.systemName);
-        }
-        if (data.suggestedDescription) {
-          setDomainDescInput(data.suggestedDescription);
-        }
+      setAnalysisResult(data);
+      if (data.systemName) {
+        setDomainSysNameInput(data.systemName);
+      }
+      if (data.suggestedDescription) {
+        setDomainDescInput(data.suggestedDescription);
       }
     } catch (err) {
       console.error('Failed to parse structure', err);
@@ -347,36 +362,31 @@ export default function App() {
     try {
       // First save configuration changes to respect slider configurations
       if (config) {
-        await fetch(`/api/domains/${selectedDomainId}/config`, {
+        await safeFetchJson(`/api/domains/${selectedDomainId}/config`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(config)
         });
       }
 
-      const res = await fetch(`/api/domains/${selectedDomainId}/build`, {
+      const data = await safeFetchJson(`/api/domains/${selectedDomainId}/build`, {
         method: 'POST'
       });
-      const data = await res.json();
-      if (res.ok) {
-        setActiveTaskId(data.taskId);
-        setIsPolling(true);
-        // Start showing progress
-        setTaskProgress({
-          taskId: data.taskId,
-          domainName: kb?.domain.name || '',
-          status: 'running',
-          currentRound: 1,
-          maxRounds: config?.iteration.maxRounds || 5,
-          completeness: 0,
-          message: '正在初始化领域探针与检索器...',
-          logs: [{ timestamp: new Date().toISOString(), message: '开始在后台建立认知推理通道，这可能需要两到三分钟...', type: 'info' }]
-        });
-      } else {
-        alert(data.error || '无法启动生成循环。请检查 API Key 状态。');
-      }
+      setActiveTaskId(data.taskId);
+      setIsPolling(true);
+      // Start showing progress
+      setTaskProgress({
+        taskId: data.taskId,
+        domainName: kb?.domain.name || '',
+        status: 'running',
+        currentRound: 1,
+        maxRounds: config?.iteration.maxRounds || 5,
+        completeness: 0,
+        message: '正在初始化领域探针与检索器...',
+        logs: [{ timestamp: new Date().toISOString(), message: '开始在后台建立认知推理通道，这可能需要两到三分钟...', type: 'info' }]
+      });
     } catch (err: any) {
-      alert(err.message || '连接服务器异常，启动失败。');
+      alert(err.message || '无法启动生成循环。请检查 API Key 状态或连接服务器异常。');
     }
   };
 
@@ -477,10 +487,9 @@ export default function App() {
     setIsIdentifyingSubindustries(true);
     setSubIndustryStatusMsg({ text: '正在召唤行业分析专家智能提取子行业属性分类...', type: 'success' });
     try {
-      const res = await fetch(`/api/domains/${selectedDomainId}/identify-subindustries`, {
+      const data = await safeFetchJson(`/api/domains/${selectedDomainId}/identify-subindustries`, {
         method: 'POST',
       });
-      const data = await res.json();
       if (data.success && data.kb) {
         setKb(data.kb);
         setSubIndustryStatusMsg({ text: '🎉 行业公认子行业概念属性与所属类别全自动对标归网成功！已完成高精度结构化对齐。', type: 'success' });
@@ -503,15 +512,14 @@ export default function App() {
     
     try {
       const text = await file.text();
-      const response = await fetch(`/api/domains/${selectedDomainId}/import`, {
+      const data = await safeFetchJson(`/api/domains/${selectedDomainId}/import`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ markdown: text }),
       });
-      const data = await response.json();
-      if (response.ok && data.success && data.kb) {
+      if (data.success && data.kb) {
         setKb(data.kb);
         // Refresh domains list in case domain name/description changed
         fetchDomains();
