@@ -65,6 +65,25 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
+// Helper to sanitize Gemini/Third-party API error messages for clean logging
+function sanitizeErrorMessage(err: any): string {
+  if (!err) return 'Unknown Error';
+  const errMsg = err.message || String(err);
+  if (
+    errMsg.toLowerCase().includes('resource_exhausted') ||
+    errMsg.toLowerCase().includes('free_tier_requests') ||
+    errMsg.toLowerCase().includes('exceeded your current quota') ||
+    errMsg.toLowerCase().includes('quota exceeded') ||
+    errMsg.includes('429')
+  ) {
+    return 'Gemini API Quota Exceeded (429 RESOURCE_EXHAUSTED)';
+  }
+  if (errMsg.includes('ApiError') || errMsg.includes('GoogleGenAI') || errMsg.includes('throwErrorIfNotOK')) {
+    return 'Gemini API Service Error';
+  }
+  return errMsg;
+}
+
 // Wrap Gemini generateContent with auto-retrying & exponential backoff for 429/Resource Exhausted errors
 async function generateContentWithRetry(
   ai: GoogleGenAI,
@@ -126,7 +145,8 @@ async function generateContentWithRetry(
       if (!isHardQuotaExceeded && (isRateLimit || isTransient) && attempt <= maxRetries) {
         // Calculate exponential backoff delay with a slight random jitter
         const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
-        const warningMsg = `⚠️ [服务器警告] Gemini API 触发配额限制或网络抖动 (${isRateLimit ? '429 限流' : '网络异常'})。系统将在 ${(delay / 1000).toFixed(1)} 秒后自动重试 (第 ${attempt}/${maxRetries} 次重试)... 详情: ${errMsg}`;
+        const sanitizedErr = sanitizeErrorMessage(err);
+        const warningMsg = `⚠️ [服务器警告] Gemini API 触发配额限制或网络抖动 (${isRateLimit ? '429 限流' : '网络异常'})。系统将在 ${(delay / 1000).toFixed(1)} 秒后自动重试 (第 ${attempt}/${maxRetries} 次重试)... 详情: ${sanitizedErr}`;
         console.warn(warningMsg);
         
         if (task) {
@@ -140,7 +160,9 @@ async function generateContentWithRetry(
         
         await new Promise((resolve) => setTimeout(resolve, delay));
       } else {
-        // Throw the error if key is not valid, or we reached max limit
+        if (isHardQuotaExceeded) {
+          throw new Error('Gemini API Quota Exceeded (429 RESOURCE_EXHAUSTED)');
+        }
         throw err;
       }
     }
@@ -219,7 +241,7 @@ async function performDualEngineSearch(
     } catch (err: any) {
       task.logs.push({
         timestamp: new Date().toISOString(),
-        message: `⚠️ [Tavily 检索遭遇异常] ${err.message || err}。系统遵循双引擎机制，正在自动无缝切换到辅助引擎 Google Search Grounding 检索...`,
+        message: `⚠️ [Tavily 检索遭遇异常] ${err.message || err}。将自动无缝切换到备用搜索引擎 秘塔搜索...`,
         type: 'warning'
       });
       db.saveTask(task);
@@ -227,7 +249,94 @@ async function performDualEngineSearch(
   } else {
     task.logs.push({
       timestamp: new Date().toISOString(),
-      message: `ℹ️ 系统未检测到 TAVILY_API_KEY。遵循高可用搜索规则，自动无缝启动辅助引擎 Google Search Grounding 获取网页信源...`,
+      message: `ℹ️ 系统未检测到 TAVILY_API_KEY。启动备用搜索引擎 秘塔搜索...`,
+      type: 'info'
+    });
+    db.saveTask(task);
+  }
+
+  // Second Choice: Metaso Search
+  const metasoApiKey = process.env.METASO_API_KEY || 'mk-2D41D57B9308254B5C33AAFF1AF7D8A3';
+  if (metasoApiKey) {
+    try {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `🔍 [秘塔 检索] 启动秘塔AI搜索对该建设性假设进行客观评估验证...`,
+        type: 'info'
+      });
+      db.saveTask(task);
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+      const response = await fetch('https://api.metaso.cn/v1/chat/completions', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${metasoApiKey}`
+        },
+        body: JSON.stringify({
+          model: 'metaso-lite',
+          messages: [{ role: 'user', content: query }],
+          stream: false
+        })
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`秘塔 AI HTTP 错误! 状态码: ${response.status}`);
+      }
+
+      const data = await response.json() as any;
+      const content = data.choices?.[0]?.message?.content || '';
+
+      let searchExplanation = `【秘塔 AI 搜索分析】\n${content}\n\n`;
+
+      // References parsing
+      const rawReferences = data.references || data.citations || data.choices?.[0]?.message?.references || data.choices?.[0]?.message?.citations || [];
+      let sources: any[] = [];
+      if (Array.isArray(rawReferences) && rawReferences.length > 0) {
+        sources = rawReferences.map((r: any) => ({
+          title: r.title || '检索参考文献',
+          url: r.url || r.uri || '',
+          snippet: r.snippet || r.content || '',
+        })).filter((x: any) => x.url);
+      } else {
+        const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+        let match;
+        const extractedSources: any[] = [];
+        while ((match = markdownLinkRegex.exec(content)) !== null) {
+          extractedSources.push({
+            title: match[1],
+            url: match[2],
+            snippet: ''
+          });
+        }
+        sources = extractedSources;
+      }
+
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `✅ [秘塔 检索成功] 秘塔搜索引擎成功获取 ${sources.length} 条高价值文献信源。`,
+        type: 'success'
+      });
+      db.saveTask(task);
+
+      return { text: searchExplanation, sources };
+    } catch (err: any) {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `⚠️ [秘塔 检索遭遇异常] ${err.message || err}。正在自动无缝切换到辅助引擎 Google Search Grounding 检索...`,
+        type: 'warning'
+      });
+      db.saveTask(task);
+    }
+  } else {
+    task.logs.push({
+      timestamp: new Date().toISOString(),
+      message: `ℹ️ 系统未检测到 秘塔 API 秘钥。遵循高可用搜索规则，自动无缝启动辅助引擎 Google Search Grounding 获取网页信源...`,
       type: 'info'
     });
     db.saveTask(task);
@@ -253,8 +362,8 @@ async function performDualEngineSearch(
 
     return { text: searchExplanation, sources };
   } catch (gErr: any) {
-    const errMsg = gErr?.message || String(gErr);
-    console.error('Google Search Grounding failed:', gErr);
+    const errMsg = sanitizeErrorMessage(gErr);
+    console.warn('Google Search Grounding failed gracefully:', errMsg);
     if (task) {
       task.logs.push({
         timestamp: new Date().toISOString(),
@@ -384,7 +493,7 @@ async function generateFlexibleLLM(
       return await generateContentWithDeepSeek(prompt, isJson, task);
     } catch (err: any) {
       const fallbackWarning = `⚠️ [DeepSeek 遭遇异常] ${err.message || err}。正在自动开启高可用故障转移 (Failover) 至 Gemini 1.5/3.5 备用计算节点继续推演...`;
-      console.error(fallbackWarning);
+      console.warn(fallbackWarning);
       task.logs.push({
         timestamp: new Date().toISOString(),
         message: fallbackWarning,
@@ -431,8 +540,9 @@ async function generateFlexibleLLM(
 
     return { text: res.text || '' };
   } catch (err: any) {
-    const fallbackWarning = `⚠️ [Gemini 遭遇异常/限流/超额] ${err.message || err}。正在自动开启高可用故障转移 (Failover) 至 DeepSeek-Chat 备用计算节点继续推演...`;
-    console.error(fallbackWarning);
+    const sanitizedMsg = sanitizeErrorMessage(err);
+    const fallbackWarning = `⚠️ [Gemini 遭遇异常/限流/超额] ${sanitizedMsg}。正在自动开启高可用故障转移 (Failover) 至 DeepSeek-Chat 备用计算节点继续推演...`;
+    console.warn(fallbackWarning);
     task.logs.push({
       timestamp: new Date().toISOString(),
       message: fallbackWarning,
@@ -496,7 +606,8 @@ app.post('/api/domains/analyze-structure', async (req, res) => {
       });
       gText = gRes.text || '';
     } catch (gErr: any) {
-      console.warn('Gemini structure analysis failed, falling back to DeepSeek:', gErr);
+      const sanitized = sanitizeErrorMessage(gErr);
+      console.warn('Gemini structure analysis failed, falling back to DeepSeek:', sanitized);
       const dsRes = await generateContentWithDeepSeek(prompt, true);
       gText = dsRes.text || '';
     }
@@ -614,7 +725,8 @@ ${JSON.stringify(payload, null, 2)}
       });
       gText = gRes.text || '';
     } catch (gErr: any) {
-      console.warn('Gemini identify-subindustries failed, falling back to DeepSeek:', gErr);
+      const sanitized = sanitizeErrorMessage(gErr);
+      console.warn('Gemini identify-subindustries failed, falling back to DeepSeek:', sanitized);
       const dsRes = await generateContentWithDeepSeek(prompt, true);
       gText = dsRes.text || '';
     }
@@ -2418,9 +2530,11 @@ function getJaroWinklerSimilarity(s1: string, s2: string): number {
   let k = 0;
   for (let i = 0; i < s1.length; i++) {
     if (s1Matches[i]) {
-      while (!s2Matches[k]) k++;
-      if (s1[i] !== s2[k]) t++;
-      k++;
+      while (k < s2Matches.length && !s2Matches[k]) k++;
+      if (k < s2Matches.length) {
+        if (s1[i] !== s2[k]) t++;
+        k++;
+      }
     }
   }
 
