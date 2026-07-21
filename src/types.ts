@@ -102,7 +102,9 @@ export interface KB_Store {
   modules?: LevelTwoModule[];
   elements?: LevelThreeElement[];
   interactions?: SystemInteraction[];
+  dependencies?: ModuleDependency[];
   isolatedNodeSearchAttempts?: Record<string, number>;
+  lastBuiltConfig?: GeneratorConfig;
   checkpoints?: {
     phase1_1?: boolean;
     phase1_2?: boolean;
@@ -139,6 +141,15 @@ export interface SystemInteraction {
   targetModuleId: string; // 关联二级模块 ID
   coreWorkflow: string; // 二级领域核心流程
   interfaceLogic: string; // 交互及接口核心逻辑/API契约说明
+}
+
+export interface ModuleDependency {
+  id: string;
+  domainId: string;
+  fromModuleId: string;
+  toModuleId: string;
+  type: 'rpc' | 'event' | 'db' | string; // 同步RPC, 异步事件, 共享DB, 等等
+  description?: string;
 }
 
 export interface GeneratorConfig {

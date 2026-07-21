@@ -30,8 +30,10 @@ import {
   Clock,
   ExternalLink,
   BookOpen,
-  Menu
+  Menu,
+  Network
 } from 'lucide-react';
+import DependencyTopology from './components/DependencyTopology';
 import { 
   Domain, 
   KB_Store, 
@@ -59,7 +61,7 @@ const formatTokens = (val?: number) => {
 
 export default function App() {
   // Navigation & View control
-  const [activeTab, setActiveTab] = useState<'iteration' | 'glossary' | 'entities' | 'exports'>('iteration');
+  const [activeTab, setActiveTab] = useState<'iteration' | 'glossary' | 'entities' | 'exports' | 'topology'>('iteration');
   const [showLeftPanel, setShowLeftPanel] = useState(true);
   const [showRightPanel, setShowRightPanel] = useState(true);
   const [showMobileMenu, setShowMobileMenu] = useState(false);
@@ -859,6 +861,14 @@ export default function App() {
                 <FileText size={16} />
                 <span>配置微调 & 导出 MD</span>
               </button>
+
+              <button 
+                onClick={() => { setActiveTab('topology'); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-6 py-3 text-left font-medium text-sm transition-all border-l-4 ${activeTab === 'topology' ? 'bg-indigo-50 border-indigo-600 text-indigo-700 font-bold' : 'text-slate-600 hover:bg-slate-50 border-transparent'}`}
+              >
+                <Network size={16} />
+                <span>架构拓扑与耦合分析</span>
+              </button>
             </nav>
 
             <div className="p-4 border-t border-slate-200 bg-slate-50 text-[10.5px] text-slate-500 font-mono space-y-1">
@@ -956,6 +966,15 @@ export default function App() {
           >
             <FileText size={16} className={`${activeTab === 'exports' ? 'text-indigo-600' : 'text-slate-400'}`} />
             <span>配置微调 & 导出 MD</span>
+          </button>
+
+          <button 
+            id="nav-tab-topology"
+            onClick={() => setActiveTab('topology')}
+            className={`w-full flex items-center gap-3 px-6 py-3 text-left font-medium text-sm transition-all border-r-4 ${activeTab === 'topology' ? 'bg-indigo-50 border-indigo-600 text-indigo-700' : 'text-slate-600 hover:bg-slate-50 border-transparent'}`}
+          >
+            <Network size={16} className={`${activeTab === 'topology' ? 'text-indigo-600' : 'text-slate-400'}`} />
+            <span>架构拓扑与耦合分析</span>
           </button>
 
           {/* Delete active workspace buttons */}
@@ -2901,19 +2920,19 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="border-t border-slate-100 pt-4">
+                     <div className="border-t border-slate-100 pt-4">
                       <label className="text-xs font-bold text-slate-600 block mb-1.5">核心 LLM 推理大模型 (Core AI Engine)</label>
                       <select 
                         id="config-preferredModel"
-                        value={config.preferredModel || 'deepseek'}
+                        value={config.preferredModel || 'gemini'}
                         onChange={(e) => handleConfigChange('preferredModel', e.target.value)}
                         className="w-full bg-slate-50 border border-slate-200 rounded p-2 text-xs focus:outline-none focus:border-indigo-500 font-semibold text-slate-800"
                       >
-                        <option value="deepseek">🔵 DeepSeek-Chat (sk-de8f... 官方满血默认)</option>
-                        <option value="gemini">♊ Google Gemini 3.5 Flash (混合高可用备用)</option>
+                        <option value="gemini">♊ Google Gemini 3.5 Flash (官方推荐高可用默认)</option>
+                        <option value="deepseek">🔵 DeepSeek-Chat (备选推理模型)</option>
                       </select>
                       <p className="text-[11px] text-slate-400 mt-1">
-                        系统默认优先使用 <b>DeepSeek</b>。开启任务后，引擎将在演绎推理、冲突融合等核心逻辑调用 DeepSeek 接口。检索实证环节采用双引擎设计，默认直连 <b>Tavily</b> 搜索引擎进行行业标准深度对标，并智能运用 Google Search Grounding 作为高可用辅助备份，为架构探针提供双重实证 and 精确溯源支持。
+                        系统默认优先使用 <b>Gemini</b>。开启任务后，引擎将在演绎推理、冲突融合等核心逻辑调用 Google Gemini 接口。检索实证环节采用双引擎设计，默认直连 <b>Tavily</b> 搜索引擎进行行业标准深度对标，并智能运用 Google Search Grounding 作为高可用辅助备份，为架构探针提供双重实证 and 精确溯源支持。
                       </p>
                     </div>
 
@@ -3084,6 +3103,34 @@ export default function App() {
                   </div>
 
                 </div>
+              )}
+
+              {/* TAB 5: ARCHITECTURE TOPOLOGY VISUALIZER */}
+              {activeTab === 'topology' && kb && (
+                <DependencyTopology 
+                  kb={kb} 
+                  onUpdateKB={(updatedKB) => {
+                    setKb(updatedKB);
+                    if (selectedDomainId) {
+                      fetch(`/api/domains/${selectedDomainId}/kb`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(updatedKB)
+                      })
+                      .then(res => res.json())
+                      .then(data => {
+                        if (data.success) {
+                          console.log('Successfully persisted topology updates');
+                        } else {
+                          console.error('Failed to persist topology updates:', data.error);
+                        }
+                      })
+                      .catch(err => {
+                        console.error('Error persisting topology updates:', err);
+                      });
+                    }
+                  }}
+                />
               )}
 
             </div>

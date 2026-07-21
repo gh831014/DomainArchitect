@@ -102,6 +102,11 @@ async function generateContentWithRetry(
       attempt++;
       const errMsg = err?.message || String(err);
       
+      const isHardQuotaExceeded = errMsg.toLowerCase().includes('free_tier_requests') ||
+                                  errMsg.toLowerCase().includes('exceeded your current quota') ||
+                                  errMsg.toLowerCase().includes('billing details') ||
+                                  errMsg.toLowerCase().includes('quota exceeded for metric');
+
       const isRateLimit = errMsg.includes('429') || 
                           errMsg.toLowerCase().includes('quota') || 
                           errMsg.toLowerCase().includes('exhausted') ||
@@ -118,7 +123,7 @@ async function generateContentWithRetry(
                           errMsg.toLowerCase().includes('socket') ||
                           errMsg.toLowerCase().includes('connection');
       
-      if ((isRateLimit || isTransient) && attempt <= maxRetries) {
+      if (!isHardQuotaExceeded && (isRateLimit || isTransient) && attempt <= maxRetries) {
         // Calculate exponential backoff delay with a slight random jitter
         const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
         const warningMsg = `⚠️ [服务器警告] Gemini API 触发配额限制或网络抖动 (${isRateLimit ? '429 限流' : '网络异常'})。系统将在 ${(delay / 1000).toFixed(1)} 秒后自动重试 (第 ${attempt}/${maxRetries} 次重试)... 详情: ${errMsg}`;
@@ -173,7 +178,7 @@ async function performDualEngineSearch(
           query: query,
           search_depth: 'basic',
           include_answer: true,
-          max_results: 20
+          max_results: 10
         })
       });
 
@@ -229,23 +234,40 @@ async function performDualEngineSearch(
   }
 
   // Fallback to Google Search Grounding with Gemini
-  const searchRes = await generateContentWithRetry(ai, {
-    model: 'gemini-3.5-flash',
-    contents: query,
-    config: {
-      tools: [{ googleSearch: {} }],
+  try {
+    const searchRes = await generateContentWithRetry(ai, {
+      model: 'gemini-3.5-flash',
+      contents: query,
+      config: {
+        tools: [{ googleSearch: {} }],
+      }
+    }, task);
+
+    const searchExplanation = searchRes.text || '没有返回具体的检索文本。';
+    const chunks = searchRes.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    const sources = chunks.map((ck: any) => ({
+      title: ck.web?.title || '检索参考文献',
+      url: ck.web?.uri || '',
+      snippet: ck.web?.snippet || searchExplanation.substring(0, 100),
+    })).filter((x: any) => x.url);
+
+    return { text: searchExplanation, sources };
+  } catch (gErr: any) {
+    const errMsg = gErr?.message || String(gErr);
+    console.error('Google Search Grounding failed:', gErr);
+    if (task) {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `⚠️ [Google Search Grounding 异常] ${errMsg}。系统将跳过实时检索实证，基于已有标准知识库进行架构推导。`,
+        type: 'warning'
+      });
+      db.saveTask(task);
     }
-  }, task);
-
-  const searchExplanation = searchRes.text || '没有返回具体的检索文本。';
-  const chunks = searchRes.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-  const sources = chunks.map((ck: any) => ({
-    title: ck.web?.title || '检索参考文献',
-    url: ck.web?.uri || '',
-    snippet: ck.web?.snippet || searchExplanation.substring(0, 100),
-  })).filter((x: any) => x.url);
-
-  return { text: searchExplanation, sources };
+    return { 
+      text: `（由于当前辅助检索引擎受限或配额耗尽，无法获取 "${query}" 实时信源，此条目已自动切换为基于已有专家架构准则推演进行）`, 
+      sources: [] 
+    };
+  }
 }
 
 // DeepSeek LLM API Connector with Auto-retry and Exponential Backoff
@@ -321,8 +343,9 @@ async function generateContentWithDeepSeek(
       attempt++;
       const errMsg = err?.message || String(err);
       const isAbort = errMsg.toLowerCase().includes('abort') || errMsg.toLowerCase().includes('timeout');
+      const isHardError = errMsg.includes('无须重试') || errMsg.includes('Status 401') || errMsg.includes('Status 402') || errMsg.includes('Status 403') || errMsg.includes('鉴权失败') || errMsg.includes('额度不足');
       
-      if (attempt <= maxRetries) {
+      if (!isHardError && attempt <= maxRetries) {
         const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
         const msg = `⚠️ [DeepSeek 接口重试] ${isAbort ? '请求遭遇超时' : '触发频率限制或网络抖动'} (${errMsg})。将在 ${(delay / 1000).toFixed(1)} 秒后进行第 ${attempt}/${maxRetries} 次重试...`;
         console.warn(msg);
@@ -336,19 +359,19 @@ async function generateContentWithDeepSeek(
         }
         await new Promise((resolve) => setTimeout(resolve, delay));
       } else {
-        throw new Error(`DeepSeek API 最终调用失败 (尝试了 ${maxRetries} 次): ${errMsg}`);
+        throw new Error(`DeepSeek API 最终调用失败 (尝试了 ${attempt} 次): ${errMsg}`);
       }
     }
   }
 }
 
-// Dual-LLM Hub: Runs DeepSeek by default, with automatic self-healing backup transition to Gemini if any error occurs
+// Dual-LLM Hub: Runs Gemini by default, with alternative option for DeepSeek. Supports mutual bidirectional failover.
 async function generateFlexibleLLM(
   prompt: string,
   isJson: boolean,
   task: any,
   aiGemini: GoogleGenAI,
-  preferredModel: 'deepseek' | 'gemini' = 'deepseek'
+  preferredModel: 'deepseek' | 'gemini' = 'gemini'
 ): Promise<{ text: string }> {
   if (preferredModel === 'deepseek') {
     try {
@@ -368,27 +391,64 @@ async function generateFlexibleLLM(
         type: 'warning'
       });
       db.saveTask(task);
+
+      // Fallback to Gemini
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `🤖 [模型计算 - 故障转移] 使用 Google Gemini (gemini-3.5-flash) 进行高层意图推演...`,
+        type: 'info'
+      });
+      db.saveTask(task);
+      const res = await generateContentWithRetry(aiGemini, {
+        model: 'gemini-3.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: isJson ? 'application/json' : undefined,
+          temperature: 0.2,
+        }
+      }, task);
+      return { text: res.text || '' };
     }
   }
 
-  // Fallback to Gemini
-  task.logs.push({
-    timestamp: new Date().toISOString(),
-    message: `🤖 [模型计算] 使用 Google Gemini (gemini-3.5-flash) 进行高层意图推演...`,
-    type: 'info'
-  });
-  db.saveTask(task);
+  // Preferred model is Gemini
+  try {
+    task.logs.push({
+      timestamp: new Date().toISOString(),
+      message: `🤖 [模型计算] 使用 Google Gemini (gemini-3.5-flash) 进行高层意图推演...`,
+      type: 'info'
+    });
+    db.saveTask(task);
 
-  const res = await generateContentWithRetry(aiGemini, {
-    model: 'gemini-3.5-flash',
-    contents: prompt,
-    config: {
-      responseMimeType: isJson ? 'application/json' : undefined,
-      temperature: 0.2,
-    }
-  }, task);
+    const res = await generateContentWithRetry(aiGemini, {
+      model: 'gemini-3.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: isJson ? 'application/json' : undefined,
+        temperature: 0.2,
+      }
+    }, task);
 
-  return { text: res.text || '' };
+    return { text: res.text || '' };
+  } catch (err: any) {
+    const fallbackWarning = `⚠️ [Gemini 遭遇异常/限流/超额] ${err.message || err}。正在自动开启高可用故障转移 (Failover) 至 DeepSeek-Chat 备用计算节点继续推演...`;
+    console.error(fallbackWarning);
+    task.logs.push({
+      timestamp: new Date().toISOString(),
+      message: fallbackWarning,
+      type: 'warning'
+    });
+    db.saveTask(task);
+
+    // Fallback to DeepSeek
+    task.logs.push({
+      timestamp: new Date().toISOString(),
+      message: `🤖 [模型计算 - 故障转移] 启动 DeepSeek-Chat 大模型进行高维业务模型推理...`,
+      type: 'info'
+    });
+    db.saveTask(task);
+    return await generateContentWithDeepSeek(prompt, isJson, task);
+  }
 }
 
 // REST APIs
@@ -424,16 +484,24 @@ app.post('/api/domains/analyze-structure', async (req, res) => {
   "suggestedDescription": "为此新领域拟定的智能目标和描述背景，包含如何假设延展它的行业根"
 }`;
 
-    const gRes = await generateContentWithRetry(ai, {
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.1,
-      }
-    });
+    let gText = '';
+    try {
+      const gRes = await generateContentWithRetry(ai, {
+        model: 'gemini-3.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+        }
+      });
+      gText = gRes.text || '';
+    } catch (gErr: any) {
+      console.warn('Gemini structure analysis failed, falling back to DeepSeek:', gErr);
+      const dsRes = await generateContentWithDeepSeek(prompt, true);
+      gText = dsRes.text || '';
+    }
 
-    const parsed = safeParseJSON(gRes.text || '{}', {});
+    const parsed = safeParseJSON(gText, {});
     res.json(parsed);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -534,16 +602,24 @@ ${JSON.stringify(payload, null, 2)}
 ]`;
 
     const ai = getGeminiClient();
-    const gRes = await generateContentWithRetry(ai, {
-      model: 'gemini-3.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.1,
-      }
-    });
+    let gText = '';
+    try {
+      const gRes = await generateContentWithRetry(ai, {
+        model: 'gemini-3.5-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+        }
+      });
+      gText = gRes.text || '';
+    } catch (gErr: any) {
+      console.warn('Gemini identify-subindustries failed, falling back to DeepSeek:', gErr);
+      const dsRes = await generateContentWithDeepSeek(prompt, true);
+      gText = dsRes.text || '';
+    }
 
-    const classifications = safeParseJSON<any[]>(gRes.text || '[]', []);
+    const classifications = safeParseJSON<any[]>(gText, []);
     if (Array.isArray(classifications)) {
       kb.concepts = kb.concepts.map(c => {
         const matched = classifications.find(item => item.id === c.id);
@@ -1241,6 +1317,34 @@ app.post('/api/domains/:id/build', (req, res) => {
 });
 
 // Background Worker logic
+function isConfigChangedOrAdded(oldConf: any, newConf: any): boolean {
+  if (!oldConf) return false;
+
+  const oldRef = oldConf.referenceArch || {};
+  const newRef = newConf.referenceArch || {};
+  
+  if ((newRef.keyDirections || '').trim() !== (oldRef.keyDirections || '').trim()) return true;
+  if ((newRef.companyArchitecture || '').trim() !== (oldRef.companyArchitecture || '').trim()) return true;
+  if ((newRef.productArchitecture || '').trim() !== (oldRef.productArchitecture || '').trim()) return true;
+
+  if ((newConf.focusName || '').trim() !== (oldConf.focusName || '').trim()) return true;
+  if (newConf.focusType !== oldConf.focusType) return true;
+  if (newConf.targetLevel !== oldConf.targetLevel) return true;
+  if (newConf.preferredModel !== oldConf.preferredModel) return true;
+  if ((newConf.systemName || '').trim() !== (oldConf.systemName || '').trim()) return true;
+  if ((newConf.domain || '').trim() !== (oldConf.domain || '').trim()) return true;
+
+  const capOld = JSON.stringify(oldConf.capabilityMatrix || {});
+  const capNew = JSON.stringify(newConf.capabilityMatrix || {});
+  if (capOld !== capNew) return true;
+
+  const benchOld = JSON.stringify(oldConf.industryBenchmarks || {});
+  const benchNew = JSON.stringify(newConf.industryBenchmarks || {});
+  if (benchOld !== benchNew) return true;
+
+  return false;
+}
+
 async function runKnowledgeIteration(domainId: string, taskId: string) {
   const task = db.getTask(taskId);
   if (!task) return;
@@ -1252,6 +1356,32 @@ async function runKnowledgeIteration(domainId: string, taskId: string) {
     task.message = '未能载入领域基础数据或配置。';
     db.saveTask(task);
     return;
+  }
+
+  // Check if config has changed or added
+  const hasConfigChanged = isConfigChangedOrAdded(kb.lastBuiltConfig, config);
+  if (hasConfigChanged) {
+    task.logs.push({
+      timestamp: new Date().toISOString(),
+      message: `🔄 [配置变动检测] 检测到领域配置信息（重点方向、聚焦定位、架构信息等）发生变动或新增。系统将自动进入补充对标与盲点重新扫描模式，重新激活各阶段，不直接跳过！`,
+      type: 'warning',
+    });
+    db.saveTask(task);
+
+    // Reset checkpoints to false so they run again and do incremental/supplemental building
+    kb.checkpoints = {
+      phase1_1: false,
+      phase1_2: false,
+      phase1_3: false,
+      phase1_4: false,
+      phase2_round: 1,
+      phase2_rounds: {}
+    };
+
+    // Reset processed gaps and isolated node attempts so we can re-scan and search them with new guidelines
+    (kb as any).processedGapPaths = [];
+    kb.isolatedNodeSearchAttempts = {};
+    db.saveDomainKB(domainId, kb, task);
   }
 
   let ai;
@@ -1275,7 +1405,7 @@ async function runKnowledgeIteration(domainId: string, taskId: string) {
   db.saveTask(task);
 
   const uuid = (prefix: string) => `${prefix}_${Math.random().toString(36).substring(2, 9)}`;
-  const model = (config as any)?.preferredModel || 'deepseek';
+  const model = (config as any)?.preferredModel || 'gemini';
 
   let referenceArchContext = '';
   const ref = (config as any)?.referenceArch;
@@ -2103,6 +2233,9 @@ ${searchExplanation}
   // ==========================================
   // COMPLETE WORK
   // ==========================================
+  kb.lastBuiltConfig = JSON.parse(JSON.stringify(config));
+  db.saveDomainKB(domainId, kb, task);
+
   task.status = 'completed';
   task.message = '🎉 双轨/单轨闭环知识工程与大厂标准系统设计、行业典型痛点防御模型已全部推演就绪！';
   task.logs.push({
@@ -2570,6 +2703,7 @@ function applyCausalDerivationBooster(kb: KB_Store, derived: any, hypothesis: Hy
 
   // Rule 2: Entity has status field -> derive State Machine process & Audit log
   if (Array.isArray(derived.entities)) {
+    const logsToPush: any[] = [];
     for (const ent of derived.entities) {
       if (!ent.name) continue;
       const fields = ent.fields || [];
@@ -2597,7 +2731,7 @@ function applyCausalDerivationBooster(kb: KB_Store, derived: any, hypothesis: Hy
 
         const alreadyHasLog = derived.entities.some((e: any) => e.name.toLowerCase().includes(ent.name.toLowerCase() + 'changelog') || e.name.toLowerCase().includes(ent.name.toLowerCase() + 'log'));
         if (!alreadyHasLog) {
-          derived.entities.push({
+          logsToPush.push({
             aggregateRootName: ent.aggregateRootName || ent.name,
             name: `${ent.name}变更日志 (StatusChangeLog)`,
             fields: [
@@ -2612,6 +2746,7 @@ function applyCausalDerivationBooster(kb: KB_Store, derived: any, hypothesis: Hy
         }
       }
     }
+    derived.entities.push(...logsToPush);
   }
 
   // Rule 3: Pain point contains "traceability/verification" -> derive unique code generation & boundary interface interaction
@@ -3110,7 +3245,7 @@ ${JSON.stringify(kb.entities.map(e => ({ id: e.id, name: e.name, fields: e.field
 
   try {
     const config = db.getDomainConfig(kb.domain.id);
-    const model = config?.preferredModel || 'deepseek';
+    const model = config?.preferredModel || 'gemini';
     const res = await generateFlexibleLLM(detectPrompt, true, task, ai, model);
     const instructions = safeParseJSON<any[]>(res.text || '[]', []);
 

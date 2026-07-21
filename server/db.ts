@@ -481,6 +481,30 @@ export function deduplicateKB(store: KB_Store): KB_Store {
     }
   }
 
+  // 11. Deduplicate Module Dependencies
+  const uniqueDependencies: NonNullable<typeof store.dependencies> = [];
+  for (const dep of (store.dependencies || [])) {
+    const fromId = dep.fromModuleId ? (idMap.get(dep.fromModuleId) || dep.fromModuleId) : '';
+    const toId = dep.toModuleId ? (idMap.get(dep.toModuleId) || dep.toModuleId) : '';
+    if (!fromId || !toId || fromId === toId) continue;
+
+    const existing = uniqueDependencies.find(x => 
+      x.fromModuleId === fromId && x.toModuleId === toId
+    );
+    if (existing) {
+      idMap.set(dep.id, existing.id);
+      if (dep.description && (!existing.description || dep.description.length > existing.description.length)) {
+        existing.description = dep.description;
+      }
+    } else {
+      uniqueDependencies.push({
+        ...dep,
+        fromModuleId: fromId,
+        toModuleId: toId
+      });
+    }
+  }
+
   // Pass to update seeAlso list and any self references
   const updateSeeAlso = (arr: any[]) => {
     if (!arr) return;
@@ -503,7 +527,8 @@ export function deduplicateKB(store: KB_Store): KB_Store {
     hypotheses: uniqueHypotheses,
     modules: uniqueModules,
     elements: uniqueElements,
-    interactions: uniqueInteractions
+    interactions: uniqueInteractions,
+    dependencies: uniqueDependencies
   };
 
   updateSeeAlso(cleanStore.concepts);
@@ -712,7 +737,7 @@ export const db = {
         completenessThreshold: 0.85,
         perRoundMaxHypotheses: 3,
       },
-      preferredModel: 'deepseek',
+      preferredModel: 'gemini',
       referenceArch: {
         companyArchitecture: '',
         productArchitecture: '',
@@ -894,7 +919,7 @@ function getSeedDB() {
       completenessThreshold: 0.85,
       perRoundMaxHypotheses: 3,
     },
-    preferredModel: 'deepseek',
+    preferredModel: 'gemini',
   };
 
   const seedKB: KB_Store = {
