@@ -1492,6 +1492,8 @@ async function runKnowledgeIteration(domainId: string, taskId: string) {
       phase1_7: false,
       phase1_8: false,
       phase1_9: false,
+      phase1_10: false,
+      phase1_11: false,
       phase2_round: 1,
       phase2_rounds: {}
     };
@@ -2551,6 +2553,212 @@ ${existingEliteStr || '暂无'}
         kb.checkpoints.phase1_9 = true;
         db.saveDomainKB(domainId, kb, task);
       }
+    }
+
+    // ==========================================
+    // 1.10 Industry Jargon & Inner-Circle Slang Blindspot Exploration (行业黑话/切口/行话盲点探查)
+    // ==========================================
+    if (kb.checkpoints.phase1_10) {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `⏭️ [断点续传] 检测到阶段 1.10 (行业黑话与行话切口探查) 已在之前成功完成，自动快速跳过。`,
+        type: 'info'
+      });
+      db.saveTask(task);
+    } else {
+      task.message = '正在启动 1.10: 行业黑话/行话切口与角色隐性口语探查...';
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `【1.10 行业黑话与切口探查】识别 [${kb.domain.name}] 行业内各类角色使用的行业黑话、行话切口与圈内口语（如互联网"对齐/赋能"、餐饮"翻台/走菜/飞单"、电竞"拉扯/走位/开团"、医疗"带量采购/转诊"等）。`,
+        type: 'info',
+      });
+      db.saveTask(task);
+
+      const existingJargonStr = kb.concepts
+        .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_jargon')
+        .map(c => `[${c.name}]: ${c.definition}`)
+        .join('\n');
+
+      const prompt1_10 = `## 角色
+你是一个行业黑话、行话切口与圈内角色隐性口语的深度探查专家。
+
+## 任务
+针对【${kb.domain.name}】领域/行业，请识别并生成各类角色在日常作业、沟通、交易、日常运营或竞技中使用的行业黑话/切口/行话盲点假设（至少3-5个）：
+1. 黑话主要是各类角色说的、只有行业圈内人才能听懂的专业切口、口头缩略语、行业梗或习惯用语。
+例如：
+- 互联网行业：“对齐/赋能/闭环/打法/抓手/降本增效/沉淀”
+- 餐饮行业：“冲盘/客单/翻台/走菜/飞单/叫菜/尾台/压台”
+- 游戏/竞技/电竞：“拉扯/走位/收割/开团/带线/挂机/对线/控场”
+- 医疗/医药：“带量采购/开方/转诊/走量/叫号/过评”
+- 金融/证券：“割韭菜/洗盘/建仓/拉高/平仓/打新”
+- 电商/直播：“带货/GMV/破价/坑位费/控评/水军/逼单”
+- 仓储/物流：“爆仓/甩柜/倒短/落箱/平仓/抛货”
+2. 详细说明该黑话/切口的真实含义、主要使用角色场景、对应的行业背景以及实际具体意义。
+${referenceArchContext}
+
+## 已有黑话（避免重复）
+${existingJargonStr || '暂无'}
+
+## 输出格式
+请输出 JSON 数组，严禁 markdown 包装，直接以 [ 开始：
+[
+  {
+    "name": "黑话/切口名称（如：对齐 / 翻台 / 甩柜 / 挂机）",
+    "description": "详细说明该黑话的释义、使用场景/角色及背后含义",
+    "evidence_hint": "行业惯用口语或行话切口说明",
+    "initial_confidence": 0.9
+  }
+]`;
+
+      const res1_10 = await generateFlexibleLLM(prompt1_10, true, task, ai, model);
+      const rawHypList1_10 = safeParseJSON<any[]>(res1_10.text || '[]', []);
+
+      await runWithConcurrencyLimit(rawHypList1_10, 3, async (rawHyp) => {
+        if (!rawHyp || !rawHyp.name) return;
+        const q = `"${rawHyp.name}" "${kb.domain.name}" 行业黑话 行话 切口 含义`;
+        const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
+
+        const evaluatePrompt = `评估以下行业黑话/行话切口假设在【${kb.domain.name}】行业/领域中的真实存在性与理解准确度。
+假设: ${rawHyp.name} - ${rawHyp.description}
+搜索结果: ${searchExplanation}
+请必须而且仅返回一个 JSON 对象，杜绝 markdown 包裹形式:
+{
+  "is_supported": true,
+  "confidence": 0.85,
+  "final_judgment": "黑话/切口释义考证总结"
+}`;
+
+        const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
+        const evalJson = safeParseJSON<any>(evalRes.text || '{}', {});
+        const conf = evalJson.confidence ?? 0.5;
+
+        if (evalJson.is_supported && conf >= 0.65) {
+          kb.concepts.push({
+            id: uuid('c'),
+            domainId,
+            name: rawHyp.name,
+            definition: `${rawHyp.description}。【黑话考证总结: ${evalJson.final_judgment || '验证通过'}】`,
+            attributes: ['行业黑话与切口'],
+            confidence: conf,
+            sourceUrl: sources[0]?.url || '',
+            sources: sources,
+            treeType: 'industry',
+            conceptType: 'industry_jargon'
+          });
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `✅【行业黑话/切口探查成功】(置信度: ${conf}): ${rawHyp.name}`,
+            type: 'success',
+          });
+        }
+        db.saveDomainKB(domainId, kb, task);
+      });
+
+      kb.checkpoints.phase1_10 = true;
+      db.saveDomainKB(domainId, kb, task);
+    }
+
+    // ==========================================
+    // 1.11 Industry Taboos & Unwritten Rules Blindspot Exploration (行业禁忌/约定俗成规矩/潜规则探查)
+    // ==========================================
+    if (kb.checkpoints.phase1_11) {
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `⏭️ [断点续传] 检测到阶段 1.11 (行业禁忌与约定俗成规则探查) 已在之前成功完成，自动快速跳过。`,
+        type: 'info'
+      });
+      db.saveTask(task);
+    } else {
+      task.message = '正在启动 1.11: 行业禁忌与约定俗成规则/潜规则盲点探查...';
+      task.logs.push({
+        timestamp: new Date().toISOString(),
+        message: `【1.11 行业禁忌与约定俗成规则探查】识别 [${kb.domain.name}] 行业内没有明文规定、但从业人员约定俗成不允许做的事或行为禁忌（如餐饮忌碗盘缺口/竖插筷子、医疗急诊忌闲话、电竞忌公屏嘲讽挂机、商业销售忌跳单等）。`,
+        type: 'info',
+      });
+      db.saveTask(task);
+
+      const existingTabooStr = kb.concepts
+        .filter(c => c.treeType === 'industry' && c.conceptType === 'industry_taboo')
+        .map(c => `[${c.name}]: ${c.definition}`)
+        .join('\n');
+
+      const prompt1_11 = `## 角色
+你是一个行业隐性规则、内部行为禁忌与约定俗成红线的深度研究专家。
+
+## 任务
+针对【${kb.domain.name}】领域/行业，请识别并生成该行业内没有明确法律法规条文、但行业内人员约定俗成、严格不允许做的事情或行业禁忌/潜规则假设（至少3-5个）：
+1. 行业禁忌是指没有明文法律规定，但行业内部人员遵守的约定俗成规则要求或行为禁忌。
+例如：
+- 餐饮行业：“忌给客人使用有裂痕或缺口的碗盘”、“忌在后厨随意传闲话”、“忌把筷子竖着插在饭碗里”
+- 医疗/急诊：“忌在急诊室或值班室说‘今天真闲’”、“忌值班吃芒果/火龙果等特定谐音食物”
+- 游戏/电竞/桌游：“忌公屏无故嘲讽/挂机/代练”、“忌私下透漏对手战术/偷看牌”
+- 戏剧/演艺/舞台：“忌在后台随意乱动剧组道具”、“忌开演前踩台”
+- 航空/航海：“忌在控制塔或驾驶舱乱开敏感谐音玩笑”
+- 商业/销售/中介：“忌跳单”、“忌私下抢同组客户”、“忌透漏暗盘返点”
+- 证券/金融：“忌私下保底承诺”、“忌私做老鼠仓”
+2. 详细说明该禁忌的定义、涉及的角色或场景、为什么被视为行业禁忌，以及违反该约定俗成禁忌可能带来的隐性后果。
+${referenceArchContext}
+
+## 已有禁忌（避免重复）
+${existingTabooStr || '暂无'}
+
+## 输出格式
+请输出 JSON 数组，严禁 markdown 包装，直接以 [ 开始：
+[
+  {
+    "name": "行业禁忌/约定俗成规矩名称（如：后厨碗盘缺口禁忌 / 急诊室闲话禁忌 / 中介跳单禁忌）",
+    "description": "详细说明该禁忌的内容、涉及场景、为何不允许做及约定俗成要求",
+    "evidence_hint": "行业约定俗成规矩或行规口耳相传说明",
+    "initial_confidence": 0.9
+  }
+]`;
+
+      const res1_11 = await generateFlexibleLLM(prompt1_11, true, task, ai, model);
+      const rawHypList1_11 = safeParseJSON<any[]>(res1_11.text || '[]', []);
+
+      await runWithConcurrencyLimit(rawHypList1_11, 3, async (rawHyp) => {
+        if (!rawHyp || !rawHyp.name) return;
+        const q = `"${rawHyp.name}" "${kb.domain.name}" 行业禁忌 潜规则 约定俗成`;
+        const { text: searchExplanation, sources } = await performDualEngineSearch(q, ai, task);
+
+        const evaluatePrompt = `评估以下行业禁忌/约定俗成规矩假设在【${kb.domain.name}】行业/领域中的真实存在性与严谨度。
+假设: ${rawHyp.name} - ${rawHyp.description}
+搜索结果: ${searchExplanation}
+请必须而且仅返回一个 JSON 对象，杜绝 markdown 包裹形式:
+{
+  "is_supported": true,
+  "confidence": 0.85,
+  "final_judgment": "行业禁忌考证总结"
+}`;
+
+        const evalRes = await generateFlexibleLLM(evaluatePrompt, true, task, ai, model);
+        const evalJson = safeParseJSON<any>(evalRes.text || '{}', {});
+        const conf = evalJson.confidence ?? 0.5;
+
+        if (evalJson.is_supported && conf >= 0.65) {
+          kb.concepts.push({
+            id: uuid('c'),
+            domainId,
+            name: rawHyp.name,
+            definition: `${rawHyp.description}。【禁忌考证总结: ${evalJson.final_judgment || '验证通过'}】`,
+            attributes: ['行业禁忌与约定俗成规则'],
+            confidence: conf,
+            sourceUrl: sources[0]?.url || '',
+            sources: sources,
+            treeType: 'industry',
+            conceptType: 'industry_taboo'
+          });
+          task.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `✅【行业禁忌/约定俗成规则探查成功】(置信度: ${conf}): ${rawHyp.name}`,
+            type: 'success',
+          });
+        }
+        db.saveDomainKB(domainId, kb, task);
+      });
+
+      kb.checkpoints.phase1_11 = true;
+      db.saveDomainKB(domainId, kb, task);
     }
 
   } catch (err: any) {

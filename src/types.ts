@@ -21,7 +21,7 @@ export interface Concept {
   sourceUrl?: string; // Reference link
   sources?: { title: string; url: string; snippet: string }[];
   treeType?: 'system' | 'industry';
-  conceptType?: 'system_concept' | 'industry_general' | 'industry_rule' | 'industry_pain_point' | 'academic_discipline' | 'sub_academic_discipline' | 'influential_event_person' | 'special_process_requirement' | 'industry_role_position' | 'industry_elite_masterpiece';
+  conceptType?: 'system_concept' | 'industry_general' | 'industry_rule' | 'industry_pain_point' | 'academic_discipline' | 'sub_academic_discipline' | 'influential_event_person' | 'special_process_requirement' | 'industry_role_position' | 'industry_elite_masterpiece' | 'industry_jargon' | 'industry_taboo';
   subIndustry?: string; // Optional sub-industry categorizer for industry knowledge
 }
 

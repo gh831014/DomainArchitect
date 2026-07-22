@@ -125,7 +125,9 @@ export default function App() {
     ind_event: true,
     ind_special: true,
     ind_roles: true,
-    ind_elite: true
+    ind_elite: true,
+    ind_jargon: true,
+    ind_taboo: true
   });
   const [glossarySearch, setGlossarySearch] = useState('');
   const [selectedSubIndustryFilter, setSelectedSubIndustryFilter] = useState<string>('all');
@@ -1914,6 +1916,96 @@ export default function App() {
                             )}
                           </div>
 
+                          {/* 2.9 Industry Jargon & Inner-Circle Slang Branch */}
+                          <div className="mb-1">
+                            <div 
+                              onClick={() => setExpandedFolders(prev => ({ ...prev, ind_jargon: !prev.ind_jargon }))}
+                              className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
+                            >
+                              <ChevronRight 
+                                className={`text-slate-500 transition-transform duration-200 ${expandedFolders.ind_jargon ? 'rotate-90' : ''}`} 
+                                size={12} 
+                              />
+                              <span className="text-xs font-medium text-slate-700">📂 行业黑话/行话与角色切口</span>
+                              <span className="text-[9px] text-slate-400 font-mono font-semibold ml-auto">
+                                {kb ? kb.concepts.filter(c => c.treeType === 'industry' && c.conceptType === 'industry_jargon').length : 0}
+                              </span>
+                            </div>
+
+                            {expandedFolders.ind_jargon && (
+                              <div className="pl-4 pt-1 space-y-0.5 border-l border-dashed border-slate-200 ml-2.5 mt-0.5">
+                                {kb && kb.concepts.filter(c => {
+                                  const matchesSearch = !glossarySearch || c.name.toLowerCase().includes(glossarySearch.toLowerCase()) || c.definition.toLowerCase().includes(glossarySearch.toLowerCase());
+                                  return matchesSearch && c.treeType === 'industry' && c.conceptType === 'industry_jargon';
+                                }).map(c => {
+                                  const isSelected = selectedConceptId === c.id;
+                                  return (
+                                    <div 
+                                      key={c.id}
+                                      onClick={() => {
+                                        setSelectedConceptId(c.id);
+                                        setEditingConceptId(null);
+                                      }}
+                                      className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
+                                        isSelected 
+                                          ? 'bg-purple-50 text-purple-700 font-bold border-l border-purple-500 pl-1' 
+                                          : 'text-slate-600 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span>🗎</span>
+                                      <span className="truncate">{c.name}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 2.10 Industry Taboos & Unwritten Rules Branch */}
+                          <div className="mb-1">
+                            <div 
+                              onClick={() => setExpandedFolders(prev => ({ ...prev, ind_taboo: !prev.ind_taboo }))}
+                              className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
+                            >
+                              <ChevronRight 
+                                className={`text-slate-500 transition-transform duration-200 ${expandedFolders.ind_taboo ? 'rotate-90' : ''}`} 
+                                size={12} 
+                              />
+                              <span className="text-xs font-medium text-slate-700">📂 行业禁忌与约定俗成规矩</span>
+                              <span className="text-[9px] text-slate-400 font-mono font-semibold ml-auto">
+                                {kb ? kb.concepts.filter(c => c.treeType === 'industry' && c.conceptType === 'industry_taboo').length : 0}
+                              </span>
+                            </div>
+
+                            {expandedFolders.ind_taboo && (
+                              <div className="pl-4 pt-1 space-y-0.5 border-l border-dashed border-slate-200 ml-2.5 mt-0.5">
+                                {kb && kb.concepts.filter(c => {
+                                  const matchesSearch = !glossarySearch || c.name.toLowerCase().includes(glossarySearch.toLowerCase()) || c.definition.toLowerCase().includes(glossarySearch.toLowerCase());
+                                  return matchesSearch && c.treeType === 'industry' && c.conceptType === 'industry_taboo';
+                                }).map(c => {
+                                  const isSelected = selectedConceptId === c.id;
+                                  return (
+                                    <div 
+                                      key={c.id}
+                                      onClick={() => {
+                                        setSelectedConceptId(c.id);
+                                        setEditingConceptId(null);
+                                      }}
+                                      className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
+                                        isSelected 
+                                          ? 'bg-rose-50 text-rose-700 font-bold border-l border-rose-500 pl-1' 
+                                          : 'text-slate-600 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span>🗎</span>
+                                      <span className="truncate">{c.name}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
                         </div>
 
                       </div>
@@ -1965,6 +2057,12 @@ export default function App() {
                         } else if (conceptCategory === 'industry_elite_masterpiece') {
                           categoryTagLabel = '单轨精英/球星/代表作/招牌菜';
                           tagColorClass = 'bg-amber-50 text-amber-700 border-amber-200';
+                        } else if (conceptCategory === 'industry_jargon') {
+                          categoryTagLabel = '行业黑话与行话切口';
+                          tagColorClass = 'bg-purple-50 text-purple-700 border-purple-200';
+                        } else if (conceptCategory === 'industry_taboo') {
+                          categoryTagLabel = '行业禁忌与约定俗成规矩';
+                          tagColorClass = 'bg-rose-50 text-rose-700 border-rose-200';
                         }
 
                         if (isEditingThis) {
@@ -2013,6 +2111,8 @@ export default function App() {
                                       <option value="special_process_requirement">行业特殊流程与高难度要求</option>
                                       <option value="industry_role_position">行业岗位/职业与角色说明 (如店长、女巫、边后卫等)</option>
                                       <option value="industry_elite_masterpiece">单轨特有: 行业精英/热点人物/代表作/招牌菜</option>
+                                      <option value="industry_jargon">行业黑话/行话与角色切口 (如对齐/翻台/甩柜/挂机等)</option>
+                                      <option value="industry_taboo">行业禁忌/约定俗成规矩 (如急诊闲话/缺口碗盘/跳单等)</option>
                                     </select>
                                   </div>
                                   <div>
@@ -2250,6 +2350,8 @@ export default function App() {
                                 <option value="special_process_requirement">行业特殊流程与高难度要求</option>
                                 <option value="industry_role_position">行业岗位/职业与角色说明 (如店长、女巫、边后卫等)</option>
                                 <option value="industry_elite_masterpiece">单轨特有: 行业精英/热点人物/代表作/招牌菜</option>
+                                <option value="industry_jargon">行业黑话/行话与角色切口 (如对齐/翻台/甩柜/挂机等)</option>
+                                <option value="industry_taboo">行业禁忌/约定俗成规矩 (如急诊闲话/缺口碗盘/跳单等)</option>
                               </select>
                             </div>
                             <div>
