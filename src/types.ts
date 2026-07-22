@@ -21,7 +21,7 @@ export interface Concept {
   sourceUrl?: string; // Reference link
   sources?: { title: string; url: string; snippet: string }[];
   treeType?: 'system' | 'industry';
-  conceptType?: 'system_concept' | 'industry_general' | 'industry_rule' | 'industry_pain_point';
+  conceptType?: 'system_concept' | 'industry_general' | 'industry_rule' | 'industry_pain_point' | 'academic_discipline' | 'sub_academic_discipline' | 'influential_event_person' | 'special_process_requirement' | 'industry_role_position' | 'industry_elite_masterpiece';
   subIndustry?: string; // Optional sub-industry categorizer for industry knowledge
 }
 
@@ -110,6 +110,9 @@ export interface KB_Store {
     phase1_2?: boolean;
     phase1_3?: boolean;
     phase1_4?: boolean;
+    phase1_5?: boolean;
+    phase1_6?: boolean;
+    phase1_7?: boolean;
     phase2_round?: number;
     phase2_rounds?: Record<number, boolean>;
   };

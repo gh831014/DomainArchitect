@@ -120,7 +120,12 @@ export default function App() {
     system: true,
     ind_general: true,
     ind_rule: true,
-    ind_pain: true
+    ind_pain: true,
+    ind_academic: true,
+    ind_event: true,
+    ind_special: true,
+    ind_roles: true,
+    ind_elite: true
   });
   const [glossarySearch, setGlossarySearch] = useState('');
   const [selectedSubIndustryFilter, setSelectedSubIndustryFilter] = useState<string>('all');
@@ -1640,7 +1645,7 @@ export default function App() {
                           </div>
 
                           {/* 2.3 Industry Pain points Folder Branch */}
-                          <div className="mb-1">
+                          <div className="mb-2">
                             <div 
                               onClick={() => setExpandedFolders(prev => ({ ...prev, ind_pain: !prev.ind_pain }))}
                               className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
@@ -1671,7 +1676,232 @@ export default function App() {
                                       }}
                                       className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
                                         isSelected 
-                                          ? 'bg-violet-50 text-violet-700 font-bold border-l border-violet-500 pl-1' 
+                                          ? 'bg-amber-50 text-amber-700 font-bold border-l border-amber-500 pl-1' 
+                                          : 'text-slate-600 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span>🗎</span>
+                                      <span className="truncate">{c.name}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 2.4 Academic Disciplines Folder Branch */}
+                          <div className="mb-2">
+                            <div 
+                              onClick={() => setExpandedFolders(prev => ({ ...prev, ind_academic: !prev.ind_academic }))}
+                              className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
+                            >
+                              <ChevronRight 
+                                className={`text-slate-500 transition-transform duration-200 ${expandedFolders.ind_academic ? 'rotate-90' : ''}`} 
+                                size={12} 
+                              />
+                              <span className="text-xs font-medium text-slate-700">📂 对应一级与二级学科</span>
+                              <span className="text-[9px] text-slate-400 font-mono font-semibold ml-auto">
+                                {kb ? kb.concepts.filter(c => c.treeType === 'industry' && (c.conceptType === 'academic_discipline' || c.conceptType === 'sub_academic_discipline')).length : 0}
+                              </span>
+                            </div>
+
+                            {expandedFolders.ind_academic && (
+                              <div className="pl-4 pt-1 space-y-0.5 border-l border-dashed border-slate-200 ml-2.5 mt-0.5">
+                                {kb && kb.concepts.filter(c => {
+                                  const matchesSearch = !glossarySearch || c.name.toLowerCase().includes(glossarySearch.toLowerCase()) || c.definition.toLowerCase().includes(glossarySearch.toLowerCase());
+                                  return matchesSearch && c.treeType === 'industry' && (c.conceptType === 'academic_discipline' || c.conceptType === 'sub_academic_discipline');
+                                }).map(c => {
+                                  const isSelected = selectedConceptId === c.id;
+                                  return (
+                                    <div 
+                                      key={c.id}
+                                      onClick={() => {
+                                        setSelectedConceptId(c.id);
+                                        setEditingConceptId(null);
+                                      }}
+                                      className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
+                                        isSelected 
+                                          ? 'bg-emerald-50 text-emerald-700 font-bold border-l border-emerald-500 pl-1' 
+                                          : 'text-slate-600 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span>🗎</span>
+                                      <span className="truncate">{c.conceptType === 'sub_academic_discipline' ? '↳ ' : ''}{c.name}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 2.5 Historical Events & Influential Figures Branch */}
+                          <div className="mb-2">
+                            <div 
+                              onClick={() => setExpandedFolders(prev => ({ ...prev, ind_event: !prev.ind_event }))}
+                              className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
+                            >
+                              <ChevronRight 
+                                className={`text-slate-500 transition-transform duration-200 ${expandedFolders.ind_event ? 'rotate-90' : ''}`} 
+                                size={12} 
+                              />
+                              <span className="text-xs font-medium text-slate-700">📂 重大影响事件/法规/人物</span>
+                              <span className="text-[9px] text-slate-400 font-mono font-semibold ml-auto">
+                                {kb ? kb.concepts.filter(c => c.treeType === 'industry' && c.conceptType === 'influential_event_person').length : 0}
+                              </span>
+                            </div>
+
+                            {expandedFolders.ind_event && (
+                              <div className="pl-4 pt-1 space-y-0.5 border-l border-dashed border-slate-200 ml-2.5 mt-0.5">
+                                {kb && kb.concepts.filter(c => {
+                                  const matchesSearch = !glossarySearch || c.name.toLowerCase().includes(glossarySearch.toLowerCase()) || c.definition.toLowerCase().includes(glossarySearch.toLowerCase());
+                                  return matchesSearch && c.treeType === 'industry' && c.conceptType === 'influential_event_person';
+                                }).map(c => {
+                                  const isSelected = selectedConceptId === c.id;
+                                  return (
+                                    <div 
+                                      key={c.id}
+                                      onClick={() => {
+                                        setSelectedConceptId(c.id);
+                                        setEditingConceptId(null);
+                                      }}
+                                      className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
+                                        isSelected 
+                                          ? 'bg-rose-50 text-rose-700 font-bold border-l border-rose-500 pl-1' 
+                                          : 'text-slate-600 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span>🗎</span>
+                                      <span className="truncate">{c.name}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 2.6 Special Processes & Requirements Branch */}
+                          <div className="mb-2">
+                            <div 
+                              onClick={() => setExpandedFolders(prev => ({ ...prev, ind_special: !prev.ind_special }))}
+                              className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
+                            >
+                              <ChevronRight 
+                                className={`text-slate-500 transition-transform duration-200 ${expandedFolders.ind_special ? 'rotate-90' : ''}`} 
+                                size={12} 
+                              />
+                              <span className="text-xs font-medium text-slate-700">📂 行业特殊流程与要求</span>
+                              <span className="text-[9px] text-slate-400 font-mono font-semibold ml-auto">
+                                {kb ? kb.concepts.filter(c => c.treeType === 'industry' && c.conceptType === 'special_process_requirement').length : 0}
+                              </span>
+                            </div>
+
+                            {expandedFolders.ind_special && (
+                              <div className="pl-4 pt-1 space-y-0.5 border-l border-dashed border-slate-200 ml-2.5 mt-0.5">
+                                {kb && kb.concepts.filter(c => {
+                                  const matchesSearch = !glossarySearch || c.name.toLowerCase().includes(glossarySearch.toLowerCase()) || c.definition.toLowerCase().includes(glossarySearch.toLowerCase());
+                                  return matchesSearch && c.treeType === 'industry' && c.conceptType === 'special_process_requirement';
+                                }).map(c => {
+                                  const isSelected = selectedConceptId === c.id;
+                                  return (
+                                    <div 
+                                      key={c.id}
+                                      onClick={() => {
+                                        setSelectedConceptId(c.id);
+                                        setEditingConceptId(null);
+                                      }}
+                                      className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
+                                        isSelected 
+                                          ? 'bg-indigo-50 text-indigo-700 font-bold border-l border-indigo-500 pl-1' 
+                                          : 'text-slate-600 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span>🗎</span>
+                                      <span className="truncate">{c.name}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 2.7 Industry Roles & Position Responsibilities Branch */}
+                          <div className="mb-1">
+                            <div 
+                              onClick={() => setExpandedFolders(prev => ({ ...prev, ind_roles: !prev.ind_roles }))}
+                              className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
+                            >
+                              <ChevronRight 
+                                className={`text-slate-500 transition-transform duration-200 ${expandedFolders.ind_roles ? 'rotate-90' : ''}`} 
+                                size={12} 
+                              />
+                              <span className="text-xs font-medium text-slate-700">📂 职业岗位与角色/位置说明</span>
+                              <span className="text-[9px] text-slate-400 font-mono font-semibold ml-auto">
+                                {kb ? kb.concepts.filter(c => c.treeType === 'industry' && c.conceptType === 'industry_role_position').length : 0}
+                              </span>
+                            </div>
+
+                            {expandedFolders.ind_roles && (
+                              <div className="pl-4 pt-1 space-y-0.5 border-l border-dashed border-slate-200 ml-2.5 mt-0.5">
+                                {kb && kb.concepts.filter(c => {
+                                  const matchesSearch = !glossarySearch || c.name.toLowerCase().includes(glossarySearch.toLowerCase()) || c.definition.toLowerCase().includes(glossarySearch.toLowerCase());
+                                  return matchesSearch && c.treeType === 'industry' && c.conceptType === 'industry_role_position';
+                                }).map(c => {
+                                  const isSelected = selectedConceptId === c.id;
+                                  return (
+                                    <div 
+                                      key={c.id}
+                                      onClick={() => {
+                                        setSelectedConceptId(c.id);
+                                        setEditingConceptId(null);
+                                      }}
+                                      className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
+                                        isSelected 
+                                          ? 'bg-orange-50 text-orange-700 font-bold border-l border-orange-500 pl-1' 
+                                          : 'text-slate-600 hover:bg-slate-100'
+                                      }`}
+                                    >
+                                      <span>🗎</span>
+                                      <span className="truncate">{c.name}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 2.8 Single-Track Exclusive: Industry Elite, Stars & Masterpieces Branch */}
+                          <div className="mb-1">
+                            <div 
+                              onClick={() => setExpandedFolders(prev => ({ ...prev, ind_elite: !prev.ind_elite }))}
+                              className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-100/80 p-1 rounded transition-colors"
+                            >
+                              <ChevronRight 
+                                className={`text-slate-500 transition-transform duration-200 ${expandedFolders.ind_elite ? 'rotate-90' : ''}`} 
+                                size={12} 
+                              />
+                              <span className="text-xs font-medium text-slate-700">📂 单轨精英/球星/代表作/招牌菜</span>
+                              <span className="text-[9px] text-slate-400 font-mono font-semibold ml-auto">
+                                {kb ? kb.concepts.filter(c => c.treeType === 'industry' && c.conceptType === 'industry_elite_masterpiece').length : 0}
+                              </span>
+                            </div>
+
+                            {expandedFolders.ind_elite && (
+                              <div className="pl-4 pt-1 space-y-0.5 border-l border-dashed border-slate-200 ml-2.5 mt-0.5">
+                                {kb && kb.concepts.filter(c => {
+                                  const matchesSearch = !glossarySearch || c.name.toLowerCase().includes(glossarySearch.toLowerCase()) || c.definition.toLowerCase().includes(glossarySearch.toLowerCase());
+                                  return matchesSearch && c.treeType === 'industry' && c.conceptType === 'industry_elite_masterpiece';
+                                }).map(c => {
+                                  const isSelected = selectedConceptId === c.id;
+                                  return (
+                                    <div 
+                                      key={c.id}
+                                      onClick={() => {
+                                        setSelectedConceptId(c.id);
+                                        setEditingConceptId(null);
+                                      }}
+                                      className={`flex items-center gap-1.5 p-1 rounded text-[11px] cursor-pointer transition-colors ${
+                                        isSelected 
+                                          ? 'bg-amber-50 text-amber-700 font-bold border-l border-amber-500 pl-1' 
                                           : 'text-slate-600 hover:bg-slate-100'
                                       }`}
                                     >
@@ -1709,13 +1939,31 @@ export default function App() {
                         let categoryTagLabel = '系统核心术语';
                         let tagColorClass = 'bg-blue-50 text-blue-700 border-blue-200';
                         if (conceptCategory === 'industry_general') {
-                          categoryTagLabel = '行业通识及子细分下钻';
+                          categoryTagLabel = '当前行业及通识规范';
                           tagColorClass = 'bg-sky-50 text-sky-700 border-sky-200';
                         } else if (conceptCategory === 'industry_rule') {
                           categoryTagLabel = '行业 SOP 合规控制规则';
                           tagColorClass = 'bg-purple-50 text-purple-700 border-purple-200';
                         } else if (conceptCategory === 'industry_pain_point') {
-                          categoryTagLabel = '现场作业痛点/红线警告防范';
+                          categoryTagLabel = '现场作业痛点/风险防范';
+                          tagColorClass = 'bg-amber-50 text-amber-700 border-amber-200';
+                        } else if (conceptCategory === 'academic_discipline') {
+                          categoryTagLabel = '对应核心一级学科';
+                          tagColorClass = 'bg-emerald-50 text-emerald-700 border-emerald-200';
+                        } else if (conceptCategory === 'sub_academic_discipline') {
+                          categoryTagLabel = '下钻二级学科/理论模型';
+                          tagColorClass = 'bg-teal-50 text-teal-700 border-teal-200';
+                        } else if (conceptCategory === 'influential_event_person') {
+                          categoryTagLabel = '重大影响事件/核心人物/法规';
+                          tagColorClass = 'bg-rose-50 text-rose-700 border-rose-200';
+                        } else if (conceptCategory === 'special_process_requirement') {
+                          categoryTagLabel = '行业特殊流程/高约束要求';
+                          tagColorClass = 'bg-indigo-50 text-indigo-700 border-indigo-200';
+                        } else if (conceptCategory === 'industry_role_position') {
+                          categoryTagLabel = '行业职业岗位与角色/位置说明';
+                          tagColorClass = 'bg-orange-50 text-orange-700 border-orange-200';
+                        } else if (conceptCategory === 'industry_elite_masterpiece') {
+                          categoryTagLabel = '单轨精英/球星/代表作/招牌菜';
                           tagColorClass = 'bg-amber-50 text-amber-700 border-amber-200';
                         }
 
@@ -1756,9 +2004,15 @@ export default function App() {
                                       className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs font-medium text-slate-700"
                                     >
                                       {!isIndustryOnly && <option value="system_concept">系统核心主单据/技术概念</option>}
-                                      <option value="industry_general">行业通识及下钻知识 (生鲜/医药/直播等)</option>
-                                      <option value="industry_rule">大厂 SOP 规章合规性限制</option>
+                                      <option value="industry_general">当前行业及通识规范 (词汇/标准)</option>
+                                      <option value="industry_rule">企业级业务 SOP 规章与规则</option>
                                       <option value="industry_pain_point">具体现场操作痛点/防控红线</option>
+                                      <option value="academic_discipline">对应一级学科知识</option>
+                                      <option value="sub_academic_discipline">下钻二级学科/理论模型</option>
+                                      <option value="influential_event_person">行业重大影响事件/人物/法规</option>
+                                      <option value="special_process_requirement">行业特殊流程与高难度要求</option>
+                                      <option value="industry_role_position">行业岗位/职业与角色说明 (如店长、女巫、边后卫等)</option>
+                                      <option value="industry_elite_masterpiece">单轨特有: 行业精英/热点人物/代表作/招牌菜</option>
                                     </select>
                                   </div>
                                   <div>
@@ -1987,9 +2241,15 @@ export default function App() {
                                 className="w-full bg-slate-50 border border-slate-200 rounded p-1.5 text-xs focus:outline-none focus:border-indigo-500 font-semibold text-slate-700"
                               >
                                 {!isIndustryOnly && <option value="system_concept">系统核心主单据/概念词汇</option>}
-                                <option value="industry_general">行业通识及下钻知识 (生鲜/医药/直播电商等)</option>
-                                <option value="industry_rule">企业级业务 SOP 规划</option>
+                                <option value="industry_general">当前行业及通识规范 (词汇/标准)</option>
+                                <option value="industry_rule">企业级业务 SOP 规章与规则</option>
                                 <option value="industry_pain_point">具体现场操作痛点/防控红线</option>
+                                <option value="academic_discipline">对应一级学科知识</option>
+                                <option value="sub_academic_discipline">下钻二级学科/理论模型</option>
+                                <option value="influential_event_person">行业重大影响事件/人物/法规</option>
+                                <option value="special_process_requirement">行业特殊流程与高难度要求</option>
+                                <option value="industry_role_position">行业岗位/职业与角色说明 (如店长、女巫、边后卫等)</option>
+                                <option value="industry_elite_masterpiece">单轨特有: 行业精英/热点人物/代表作/招牌菜</option>
                               </select>
                             </div>
                             <div>
